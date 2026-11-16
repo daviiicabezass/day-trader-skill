@@ -131,7 +131,7 @@ def parse_hm(text):
 def parse_now(text):
     """'2026-10-19 10:15' (Nueva York), o con zona al final: 'london', 'ny', 'utc'."""
     if not text:
-        return datetime.datetime.utcnow().replace(microsecond=0)
+        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
     parts = text.split()
     zone = "ny"
     if parts and parts[-1].lower() in ("ny", "london", "londres", "utc"):
