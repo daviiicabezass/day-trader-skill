@@ -30,6 +30,7 @@ y de Nueva York (segundo domingo de marzo a primer domingo de noviembre) se calc
 """
 
 import argparse
+import bisect
 import datetime
 import gzip
 import json
@@ -68,12 +69,12 @@ DEFAULTS = {
 
 SESSIONS = {
     "london": {"name": "Londres", "tz": "london", "open": "08:00", "no_entries_after": "11:00", "flat_by": "16:00",
-               "target": "2R"},
+               "target": "1R", "trend_filter": True, "width_filter": False},
     "ny": {"name": "Nueva York", "tz": "ny", "open": "08:20", "no_entries_after": "11:30", "flat_by": "13:25",
-           "target": "2R"},
+           "target": "2R", "trend_filter": True, "width_filter": False},
     # la tarde europea: de la apertura de la bolsa de EE. UU. (15:30 en Espana) a las 20:00 de Espana
     "tarde": {"name": "Tarde (15:30-20:00 Espana)", "tz": "ny", "open": "09:30", "no_entries_after": "12:30",
-              "flat_by": "13:55", "target": "1R"},
+              "flat_by": "13:55", "target": "1R", "trend_filter": True, "width_filter": False},
 }
 TZ_NAMES = {"ny": "Nueva York", "london": "Londres", "utc": "UTC"}
 
@@ -463,6 +464,8 @@ def orb_report(doc, source):
         else:
             lines.append("ESPERANDO  todavia no ha cerrado ninguna vela despues del rango.")
         lines.append("Entradas hasta las %s (%s)." % (doc["cutoff"], tzn))
+    elif st == "filtered":
+        lines.append("FILTRADO  hoy no hay operacion en esta sesion: %s." % doc.get("filter_reason", ""))
     else:
         lines.append("CADUCADO  ninguna vela cerro fuera del rango antes de las %s (%s). Hoy no hay entrada." % (doc["cutoff"], tzn))
     return "\n".join(lines)
@@ -732,6 +735,195 @@ def replay_report(doc):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- filtros y backtest
+
+class Trend(object):
+    """Tendencia de 1 hora: media exponencial de 20 frente a la de 50, con velas de 1 hora ya cerradas."""
+
+    def __init__(self, idx, fast=20, slow=50, min_hours=60):
+        hours = {}
+        for t in sorted(idx):
+            hours[t.replace(minute=0)] = idx[t][4]
+        kf, ks = 2.0 / (fast + 1), 2.0 / (slow + 1)
+        ef = es = None
+        self.ends, self.vals = [], []
+        for n, h in enumerate(sorted(hours), 1):
+            c = hours[h]
+            ef = c if ef is None else c * kf + ef * (1 - kf)
+            es = c if es is None else c * ks + es * (1 - ks)
+            self.ends.append(h + datetime.timedelta(hours=1))
+            self.vals.append((ef, es, n))
+        self.min_hours = min_hours
+
+    def at(self, t):
+        """'long', 'short', o None si aun no hay historia suficiente."""
+        i = bisect.bisect_right(self.ends, t) - 1
+        if i < 0:
+            return None
+        ef, es, n = self.vals[i]
+        if n < self.min_hours:
+            return None
+        return "long" if ef > es else "short"
+
+
+def median(xs):
+    s = sorted(xs)
+    m = len(s) // 2
+    return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def width_ok(width, prior, lo=0.5, hi=2.0, lookback=20, min_prior=10):
+    """El rango de hoy frente a la mediana de los ultimos 20: ni la mitad ni el doble."""
+    prior = prior[-lookback:]
+    if len(prior) < min_prior:
+        return True, None
+    m = median(prior)
+    return lo * m <= width <= hi * m, m
+
+
+def range_widths(idx, sess, k, before_day):
+    """Anchura del rango de apertura de cada dia anterior a before_day con el rango completo."""
+    if not idx:
+        return []
+    out = []
+    d = to_local(min(idx), sess["tz"]).date()
+    while d < before_day:
+        if d.weekday() < 5:
+            o, _, _ = bounds(d, sess)
+            rg = opening_range(idx, o, k)
+            if rg:
+                out.append(rg[0] - rg[1])
+        d += datetime.timedelta(days=1)
+    return out
+
+
+def trade_session(bars, k, cutoff_slot, side, stop_rule, rr):
+    """La regla en una sesion completa: (lado, entrada, stop, resultado, R bruta) o None si no se activa."""
+    n = len(bars)
+    hi = max(b[2] for b in bars[:k])
+    lo = min(b[3] for b in bars[:k])
+    ent, s = None, None
+    for i in range(k, min(cutoff_slot, n)):
+        c = bars[i][4]
+        if side in ("long", "both") and c > hi:
+            ent, s = i, "long"
+        elif side in ("short", "both") and c < lo:
+            ent, s = i, "short"
+        if ent is not None:
+            break
+    if ent is None:
+        return None
+    long = s == "long"
+    e = bars[ent][4]
+    stop = stop_from_rule(stop_rule, s, e, hi, lo)
+    risk = abs(e - stop)
+    if risk <= 0:
+        return None
+    tgt = e + (rr * risk if long else -rr * risk)
+    out = None
+    for b in bars[ent + 1:]:
+        if long:
+            if b[3] <= stop:
+                out = "stop"
+            elif b[2] >= tgt:
+                out = "target"
+        else:
+            if b[2] >= stop:
+                out = "stop"
+            elif b[3] <= tgt:
+                out = "target"
+        if out:
+            break
+    if out is None:
+        out = "neither"
+        r = (bars[-1][4] - e) / risk * (1 if long else -1)
+    else:
+        r = rr if out == "target" else -1.0
+    return s, e, risk, out, r
+
+
+def backtest(idx, sess, cfg, rr=1.0, stop_rule="or-mid", trend=False, width=False, k=3, before_day=None):
+    """La regla en todas las sesiones completas de los datos. R neta = R menos el spread (en R)."""
+    n = n_slots(sess)
+    spread = float(cfg["spread"])
+    tr = Trend(idx) if trend else None
+    days = sorted({to_local(t, sess["tz"]).date() for t in idx})
+    widths = []
+    res = {"sessions": 0, "fired": 0, "target": 0, "stop": 0, "neither": 0, "skipped_width": 0,
+           "skipped_trend": 0, "r": [], "trades": []}
+    for d in days:
+        if d.weekday() >= 5 or (before_day and d >= before_day):
+            continue
+        o, cut, _ = bounds(d, sess)
+        rg = opening_range(idx, o, k)
+        if rg is None:
+            continue
+        w = rg[0] - rg[1]
+        prior = list(widths)
+        widths.append(w)
+        bars = [idx.get(o + i * FIVE) for i in range(n)]
+        if any(b is None for b in bars):
+            continue
+        res["sessions"] += 1
+        if width and not width_ok(w, prior)[0]:
+            res["skipped_width"] += 1
+            continue
+        side = "both"
+        if trend:
+            side = tr.at(o)
+            if side is None:
+                res["skipped_trend"] += 1
+                continue
+        cutoff_slot = int((cut - o).total_seconds() // 300)
+        t = trade_session(bars, k, cutoff_slot, side, stop_rule, rr)
+        if t is None:
+            continue
+        s, e, risk, out, r = t
+        net = r - spread / risk
+        res["fired"] += 1
+        res[out] += 1
+        res["r"].append(net)
+        res["trades"].append({"date": d.isoformat(), "side": s, "entry": round(e, 2), "outcome": out, "r": round(net, 3)})
+    rl = res.pop("r")
+    res["total_r"] = sum(rl)
+    res["avg_r"] = sum(rl) / len(rl) if rl else None
+    res["win_pct"] = 100.0 * sum(1 for x in rl if x > 0) / len(rl) if rl else None
+    # peor racha: maxima caida de la curva de R acumulada
+    eq = peak = dd = 0.0
+    for x in rl:
+        eq += x
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+    res["max_drawdown_r"] = dd
+    return res
+
+
+def compare(idx, sess, cfg, k=3, stop_rule="or-mid", targets=(1.0, 1.5, 2.0)):
+    rows = []
+    for label, trend, width in (("sin filtros", False, False), ("tendencia", True, False),
+                                ("anchura", False, True), ("tendencia+anchura", True, True)):
+        for rr in targets:
+            b = backtest(idx, sess, cfg, rr, stop_rule, trend, width, k)
+            rows.append((label, rr, b))
+    return rows
+
+
+def compare_report(rows, sess):
+    lines = ["Backtest de la sesion de %s (R neta de spread, stop en %s):" % (sess["name"], "el punto medio del rango"),
+             "  filtros             objetivo  operaciones  objetivo/stop/ninguno  acierto   R total  R media  peor racha"]
+    for label, rr, b in rows:
+        if not b["fired"]:
+            lines.append("  %-19s %4sR     0" % (label, _num(rr)))
+            continue
+        lines.append("  %-19s %4sR     %3d          %2d / %2d / %2d          %4.0f %%  %+7.2f  %+6.2f   %5.2fR" % (
+            label, _num(rr), b["fired"], b["target"], b["stop"], b["neither"], b["win_pct"], b["total_r"],
+            b["avg_r"], b["max_drawdown_r"]))
+    n = rows[0][2]["sessions"] if rows else 0
+    lines.append("Sesiones completas en los datos: %d. Con tan pocas operaciones, una diferencia pequena puede ser "
+                 "suerte: confirma con mas historia (el CSV de tu MT5 puede tener anos)." % n)
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- tamano en lotes
 
 def size_order(plan, cfg):
@@ -843,9 +1035,36 @@ def cmd_orb(a, cfg):
     now = parse_now(a.now)
     idx, source = load_bars(a, cfg)
     day = to_local(now, sess["tz"]).date()
-    doc = orb(idx, sess, day, now, a.or_minutes or int(cfg["or_minutes"]), a.side)
-    doc.update(flat_by=sess["flat_by"], source=source, symbol=cfg["symbol"])
-    print(json.dumps(doc, indent=2, ensure_ascii=False) if a.json else orb_report(doc, source))
+    om = a.or_minutes or int(cfg["or_minutes"])
+    use_trend = sess.get("trend_filter", True) if a.trend is None else a.trend
+    use_width = sess.get("width_filter", False) if a.width is None else a.width
+    side, notes, blocked = a.side, [], None
+    if use_trend:
+        o, _, _ = bounds(day, sess)
+        tside = Trend(idx).at(o)
+        if tside is None:
+            notes.append("Filtro de tendencia: no hay historia suficiente en 1 hora; no se aplica.")
+        else:
+            notes.append("Filtro de tendencia (1 hora, media de 20 frente a 50, al abrir la sesion): %s, solo %s." % (
+                "alcista" if tside == "long" else "bajista", "largos" if tside == "long" else "cortos"))
+            if side == "both":
+                side = tside
+            elif side != tside:
+                blocked = "pediste %s pero la tendencia es %s" % (side, "alcista" if tside == "long" else "bajista")
+    doc = orb(idx, sess, day, now, om, side)
+    if use_width and doc.get("opening_range"):
+        r = doc["opening_range"]
+        ok, med = width_ok(r["high"] - r["low"], range_widths(idx, sess, om // 5, day))
+        if med is not None:
+            notes.append("Filtro de anchura: rango de %.2f frente a una mediana de %.2f (valido entre %.2f y %.2f)." % (
+                r["high"] - r["low"], med, 0.5 * med, 2 * med))
+        if not ok:
+            blocked = "el rango de hoy es anormal comparado con los ultimos 20 dias"
+    if blocked and doc["status"] in ("triggered", "waiting"):
+        doc["status"] = "filtered"
+        doc["filter_reason"] = blocked
+    doc.update(flat_by=sess["flat_by"], source=source, symbol=cfg["symbol"], filter_notes=notes)
+    print(json.dumps(doc, indent=2, ensure_ascii=False) if a.json else "\n".join([orb_report(doc, source)] + notes))
     if a.write and doc["status"] in ("triggered", "waiting"):
         _write(os.path.join(TRADER, "gold-entry.json"), doc)
     return 0 if doc["status"] == "triggered" else 1
@@ -895,6 +1114,26 @@ def cmd_size(a, cfg):
     print(json.dumps(o, indent=2, ensure_ascii=False) if a.json else size_report(o))
     if a.write:
         _write(os.path.join(TRADER, "gold-order.json"), o)
+    return 0
+
+
+def cmd_backtest(a, cfg):
+    sess = session_cfg(a.session, cfg)
+    idx, source = load_bars(a, cfg)
+    k = (a.or_minutes or int(cfg["or_minutes"])) // 5
+    if a.compare:
+        print(compare_report(compare(idx, sess, cfg, k, a.stop), sess))
+        print("Datos: %s." % source)
+        return 0
+    t = a.target or sess.get("target") or "2R"
+    if not t.upper().endswith("R"):
+        raise GoldError("el backtest necesita un objetivo en R (1R, 1.5R, 2R)")
+    use_trend = sess.get("trend_filter", True) if a.trend is None else a.trend
+    use_width = sess.get("width_filter", False) if a.width is None else a.width
+    b = backtest(idx, sess, cfg, float(t[:-1]), a.stop, use_trend, use_width, k)
+    print(json.dumps(b, indent=2) if a.json else compare_report([(
+        "+".join([x for x, on in (("tendencia", use_trend), ("anchura", use_width)) if on]) or "sin filtros",
+        float(t[:-1]), b)], sess))
     return 0
 
 
@@ -1031,6 +1270,12 @@ def main(argv=None):
         sp.add_argument("--offline", help="JSON de Yahoo guardado (.json o .json.gz)")
         sp.add_argument("--basis", type=float, help="suma esto a los precios de Yahoo (futuros -> spot)")
 
+    def filter_opts(sp):
+        sp.add_argument("--trend", dest="trend", action="store_true", default=None, help="filtro de tendencia de 1 hora")
+        sp.add_argument("--no-trend", dest="trend", action="store_false")
+        sp.add_argument("--width", dest="width", action="store_true", default=None, help="filtro de anchura del rango")
+        sp.add_argument("--no-width", dest="width", action="store_false")
+
     sp = sub.add_parser("clock")
     sp.add_argument("--now")
     sp = sub.add_parser("orb")
@@ -1040,6 +1285,16 @@ def main(argv=None):
     sp.add_argument("--now")
     sp.add_argument("--write", action="store_true")
     sp.add_argument("--json", action="store_true")
+    filter_opts(sp)
+    data_opts(sp)
+    sp = sub.add_parser("backtest")
+    sp.add_argument("--session", default="london", choices=sorted(SESSIONS))
+    sp.add_argument("--target")
+    sp.add_argument("--stop", default="or-mid", choices=["or-mid", "or-opposite"])
+    sp.add_argument("--or-minutes", type=int)
+    sp.add_argument("--compare", action="store_true", help="todas las combinaciones de filtros y objetivos")
+    sp.add_argument("--json", action="store_true")
+    filter_opts(sp)
     data_opts(sp)
     sp = sub.add_parser("plan")
     sp.add_argument("--stop", default="or-mid")
@@ -1083,7 +1338,8 @@ def main(argv=None):
     try:
         cfg = load_config(a.config)
         return {"clock": cmd_clock, "orb": cmd_orb, "plan": cmd_plan, "replay": cmd_replay,
-                "size": cmd_size, "ticket": cmd_ticket, "journal": cmd_journal}[a.cmd](a, cfg)
+                "size": cmd_size, "ticket": cmd_ticket, "journal": cmd_journal,
+                "backtest": cmd_backtest}[a.cmd](a, cfg)
     except GoldError as e:
         print("No se pudo: %s" % e, file=sys.stderr)
         return 2

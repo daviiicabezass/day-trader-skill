@@ -41,13 +41,14 @@ python3 "${CLAUDE_SKILL_DIR}/gold.py" orb --session tarde --write             # 
 python3 "${CLAUDE_SKILL_DIR}/gold.py" journal add                             # apunta la senal en el diario
 python3 "${CLAUDE_SKILL_DIR}/gold.py" journal check                           # cierra las abiertas con las velas
 python3 "${CLAUDE_SKILL_DIR}/gold.py" journal show                            # el diario y los totales
+python3 "${CLAUDE_SKILL_DIR}/gold.py" backtest --session tarde --compare     # filtros y objetivos en el historial
 ```
 
 ## Las tres sesiones
 
 | sesión | rango de apertura | entradas hasta | fuera a las | objetivo por defecto |
 | --- | --- | --- | --- | --- |
-| `london` | 08:00-08:15 Londres | 11:00 Londres | 16:00 Londres | 2R |
+| `london` | 08:00-08:15 Londres | 11:00 Londres | 16:00 Londres | 1R |
 | `ny` | 08:20-08:35 Nueva York | 11:30 Nueva York | 13:25 Nueva York | 2R |
 | `tarde` | 09:30-09:45 Nueva York (15:30-15:45 en España) | 12:30 NY (18:30 España) | 13:55 NY (19:55 España) | 1R |
 
@@ -55,6 +56,27 @@ python3 "${CLAUDE_SKILL_DIR}/gold.py" journal show                            # 
 y Europa cambian de hora en fechas distintas (marzo y finales de octubre) en
 España empieza a las 14:30. En sus primeras pruebas el objetivo 1R tuvo mejor
 historial que el 2R en esta franja; `--target` lo cambia.
+
+## Los filtros y el backtest
+
+- **Tendencia (activado por defecto).** Al abrir la sesión mira la tendencia
+  de 1 hora (media exponencial de 20 frente a la de 50, con velas de 1 hora
+  ya cerradas): alcista, solo largos; bajista, solo cortos. `--no-trend` lo
+  quita. En los datos de noviembre de 2026 mejoró el resultado en casi todas
+  las combinaciones de las tres sesiones.
+- **Anchura (desactivado por defecto).** Salta el día si el rango mide menos
+  de la mitad o más del doble de la mediana de los 20 días anteriores.
+  `--width` lo activa. En esos datos ayudó en Londres y empeoró en Nueva York:
+  no es fiable.
+- **Backtest.** `gold.py backtest --session tarde` da la regla en todas las
+  sesiones de los datos, con la R neta de spread, el acierto y la peor racha.
+  `--compare` prueba todas las combinaciones de filtros y objetivos (1R, 1.5R,
+  2R); `--stop or-opposite` cambia el stop.
+
+Con Yahoo solo hay unas 45 sesiones (60 días): 30 operaciones son pocas y
+probar muchas combinaciones invita a elegir la que tuvo suerte. Antes de fiarte
+de un ajuste, repite el backtest con años de velas del CSV de tu MT5. Londres
+salió en negativo en esos datos incluso con el filtro: dilo al usuario.
 
 ## El diario (para probar en demo)
 

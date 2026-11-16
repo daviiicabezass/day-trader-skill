@@ -370,3 +370,47 @@ class Journal(unittest.TestCase):
         self.assertIn("abierta", g.journal_report(doc))
         with self.assertRaises(g.GoldError):
             g.journal_add({"trades": []}, dict(self.PLAN, entry_utc=None), None, g.DEFAULTS)
+
+
+class Filters(unittest.TestCase):
+    def ramp(self, step):
+        idx = {}
+        t = D(2026, 10, 1, 0, 0)
+        p = 2600.0
+        for _ in range(12 * 24 * 6):
+            idx[t] = bar(t, p, p + 0.5, p - 0.5, p + step)
+            p += step
+            t += FIVE
+        return idx
+
+    def test_trend_follows_the_hourly_averages(self):
+        self.assertEqual(g.Trend(self.ramp(0.05)).at(D(2026, 10, 6, 12, 0)), "long")
+        self.assertEqual(g.Trend(self.ramp(-0.05)).at(D(2026, 10, 6, 12, 0)), "short")
+        self.assertIsNone(g.Trend(self.ramp(0.05)).at(D(2026, 10, 1, 5, 0)))   # not enough hours yet
+
+    def test_width_band(self):
+        prior = [10.0] * 20
+        self.assertEqual(g.width_ok(10, prior), (True, 10.0))
+        self.assertFalse(g.width_ok(4.9, prior)[0])
+        self.assertFalse(g.width_ok(20.1, prior)[0])
+        self.assertTrue(g.width_ok(100, [10.0] * 5)[0])   # too little history: no filter
+
+    def test_trade_session_both_sides(self):
+        lon = g.session_cfg("london", g.DEFAULTS)
+        idx = session_idx(DAY, lon, [2653.0, 2647.5, 2640.0] + [2640.0] * 90, RANGE)
+        o, _, _ = g.bounds(DAY, lon)
+        bars = [idx[o + i * FIVE] for i in range(g.n_slots(lon))]
+        side, e, risk, out, r = g.trade_session(bars, 3, 36, "both", "or-mid", 1.0)
+        self.assertEqual((side, e, out, r), ("short", 2647.5, "target", 1.0))
+        self.assertIsNone(g.trade_session(bars, 3, 36, "long", "or-mid", 1.0))
+
+    def test_backtest_and_compare_on_the_walk(self):
+        idx = g.parse_yahoo(walk_yahoo())
+        tarde = g.session_cfg("tarde", g.DEFAULTS)
+        b = g.backtest(idx, tarde, g.DEFAULTS, 1.0)
+        self.assertGreater(b["sessions"], 30)
+        self.assertEqual(b["fired"], b["target"] + b["stop"] + b["neither"])
+        self.assertEqual(len(b["trades"]), b["fired"])
+        rows = g.compare(idx, tarde, g.DEFAULTS)
+        self.assertEqual(len(rows), 12)
+        self.assertIn("tendencia+anchura", g.compare_report(rows, tarde))
