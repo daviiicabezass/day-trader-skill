@@ -73,6 +73,21 @@ or in the `SEC_USER_AGENT` environment variable.
 | `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
 | `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
 
+## Extra: oro (XAUUSD) para MetaTrader 5
+
+`/trader-gold` hace el mismo recorrido para el oro, en español: ruptura del
+rango de apertura de Londres (08:00) o de Nueva York (08:20, COMEX), en largo o
+en corto, stop y objetivo, 10.000 repeticiones de la sesión, tamaño en lotes
+(100 onzas por lote, spread, margen) y el ticket para colocarlo a mano en MT5.
+Lee las velas del CSV exportado de tu MT5 o de Yahoo `GC=F`. Nunca envía una
+orden.
+
+```bash
+python3 trader-gold/gold.py orb --session london --csv XAUUSD_M5.csv --write
+python3 trader-gold/gold.py plan --write && python3 trader-gold/gold.py replay --csv XAUUSD_M5.csv
+python3 trader-gold/gold.py size --write && python3 trader-gold/gold.py ticket
+```
+
 ## How to use it
 
 Everything lands in a `trader/` folder in your project, and each skill reads
@@ -210,6 +225,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-gold/        SKILL.md, gold.py (XAUUSD, MetaTrader 5)
 tests/              unittest suite + offline fixtures
 ```
 
