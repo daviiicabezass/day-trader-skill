@@ -324,3 +324,49 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Tarde(unittest.TestCase):
+    def test_afternoon_session_is_spain_15_30_to_20_00_in_winter(self):
+        s = g.session_cfg("tarde", g.DEFAULTS)
+        o, cut, flat = g.bounds(datetime.date(2026, 11, 16), s)
+        self.assertEqual((o, cut, flat), (D(2026, 11, 16, 14, 30), D(2026, 11, 16, 17, 30), D(2026, 11, 16, 18, 55)))
+        self.assertEqual(s["target"], "1R")
+
+
+class Journal(unittest.TestCase):
+    PLAN = {"date": "2026-10-19", "session": "london", "session_name": "Londres", "tz": "london", "side": "long",
+            "entry": 2655.2, "entry_time": "08:25", "entry_utc": "2026-10-19T07:25:00Z", "stop": 2651.5,
+            "target": 2659.0, "target_r": 1.0, "risk_per_oz": 3.8}
+
+    def run_check(self, closes, now="2026-10-19 16:30 london", lots=0.1):
+        idx = session_idx(DAY, g.session_cfg("london", g.DEFAULTS), closes, RANGE)
+        doc = {"trades": []}
+        order = {"sl": 2651.5, "tp": 2659.0, "volume": lots}
+        g.journal_add(doc, dict(self.PLAN), order, g.DEFAULTS)
+        g.journal_check(doc, idx, g.parse_now(now), g.DEFAULTS)
+        return doc["trades"][0]
+
+    def test_target(self):
+        t = self.run_check([2653.0, 2655.2, 2656.0, 2659.5])
+        self.assertEqual((t["status"], t["exit"], t["r"], t["exit_time"]), ("objetivo", 2659.0, 1.0, "08:35"))
+        self.assertEqual(t["usd"], 35.0)   # 3.80 x 0.1 x 100 = 38, minus 0.30 x 0.1 x 100 spread
+
+    def test_stop_first_when_a_bar_touches_both(self):
+        t = self.run_check([2653.0, 2655.2, 2651.0])
+        self.assertEqual((t["status"], t["r"]), ("stop", -1.0))
+
+    def test_open_until_flat_by_then_closed_at_the_last_close(self):
+        self.assertEqual(self.run_check([2653.0, 2655.2] + [2656.0] * 3, now="2026-10-19 09:00 london")["status"], "abierta")
+        t = self.run_check([2653.0, 2655.2] + [2656.9] * 92)
+        self.assertEqual((t["status"], t["exit"]), ("cierre", 2656.9))
+        self.assertAlmostEqual(t["r"], 0.447, places=3)
+
+    def test_no_duplicates_and_report(self):
+        doc = {"trades": []}
+        g.journal_add(doc, dict(self.PLAN), None, g.DEFAULTS)
+        with self.assertRaises(g.GoldError):
+            g.journal_add(doc, dict(self.PLAN), None, g.DEFAULTS)
+        self.assertIn("abierta", g.journal_report(doc))
+        with self.assertRaises(g.GoldError):
+            g.journal_add({"trades": []}, dict(self.PLAN, entry_utc=None), None, g.DEFAULTS)

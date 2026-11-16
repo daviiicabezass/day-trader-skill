@@ -37,7 +37,34 @@ python3 "${CLAUDE_SKILL_DIR}/gold.py" plan --stop or-mid --target 2R --write  # 
 python3 "${CLAUDE_SKILL_DIR}/gold.py" replay --csv XAUUSD_M5.csv --write      # 10.000 repeticiones + historial
 python3 "${CLAUDE_SKILL_DIR}/gold.py" size --write                            # lotes -> trader/gold-order.json
 python3 "${CLAUDE_SKILL_DIR}/gold.py" ticket                                  # la orden para MT5, en claro
+python3 "${CLAUDE_SKILL_DIR}/gold.py" orb --session tarde --write             # la tarde: 15:30-20:00 hora de Espana
+python3 "${CLAUDE_SKILL_DIR}/gold.py" journal add                             # apunta la senal en el diario
+python3 "${CLAUDE_SKILL_DIR}/gold.py" journal check                           # cierra las abiertas con las velas
+python3 "${CLAUDE_SKILL_DIR}/gold.py" journal show                            # el diario y los totales
 ```
+
+## Las tres sesiones
+
+| sesión | rango de apertura | entradas hasta | fuera a las | objetivo por defecto |
+| --- | --- | --- | --- | --- |
+| `london` | 08:00-08:15 Londres | 11:00 Londres | 16:00 Londres | 2R |
+| `ny` | 08:20-08:35 Nueva York | 11:30 Nueva York | 13:25 Nueva York | 2R |
+| `tarde` | 09:30-09:45 Nueva York (15:30-15:45 en España) | 12:30 NY (18:30 España) | 13:55 NY (19:55 España) | 1R |
+
+`tarde` sigue el horario de Nueva York: las pocas semanas al año en que EE. UU.
+y Europa cambian de hora en fechas distintas (marzo y finales de octubre) en
+España empieza a las 14:30. En sus primeras pruebas el objetivo 1R tuvo mejor
+historial que el 2R en esta franja; `--target` lo cambia.
+
+## El diario (para probar en demo)
+
+`journal add` apunta la señal del plan actual (con los lotes de `size` si
+coinciden). `journal check` repasa las abiertas con las velas: objetivo,
+stop (si una vela toca los dos, cuenta el stop) o cierre al precio de la
+hora `flat_by`, con su R y sus dólares (con spread, sin swap ni comisiones).
+`journal show` da la tabla y los totales. Apunta TODAS las señales, ganen o
+pierdan: con menos de 30 operaciones el resultado dice poco. Se guarda en
+`trader/gold-journal.json`.
 
 Opciones comunes: `--now "2026-10-19 08:30 london"` (o `ny`, `utc`; sin zona
 es Nueva York) para fijar el reloj, `--json`, `--config RUTA`. `orb` sale con

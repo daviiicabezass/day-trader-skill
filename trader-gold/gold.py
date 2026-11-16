@@ -67,8 +67,13 @@ DEFAULTS = {
 }
 
 SESSIONS = {
-    "london": {"name": "Londres", "tz": "london", "open": "08:00", "no_entries_after": "11:00", "flat_by": "16:00"},
-    "ny": {"name": "Nueva York", "tz": "ny", "open": "08:20", "no_entries_after": "11:30", "flat_by": "13:25"},
+    "london": {"name": "Londres", "tz": "london", "open": "08:00", "no_entries_after": "11:00", "flat_by": "16:00",
+               "target": "2R"},
+    "ny": {"name": "Nueva York", "tz": "ny", "open": "08:20", "no_entries_after": "11:30", "flat_by": "13:25",
+           "target": "2R"},
+    # la tarde europea: de la apertura de la bolsa de EE. UU. (15:30 en Espana) a las 20:00 de Espana
+    "tarde": {"name": "Tarde (15:30-20:00 Espana)", "tz": "ny", "open": "09:30", "no_entries_after": "12:30",
+              "flat_by": "13:55", "target": "1R"},
 }
 TZ_NAMES = {"ny": "Nueva York", "london": "Londres", "utc": "UTC"}
 
@@ -814,7 +819,7 @@ def cmd_clock(a, cfg):
     print("Ahora: %s UTC, %s Londres, %s Nueva York." % (
         now.strftime("%Y-%m-%d %H:%M"), to_local(now, "london").strftime("%H:%M"), to_local(now, "ny").strftime("%H:%M")))
     print("Oro (XAUUSD): %s." % ("ABIERTO" if market_open(now) else "CERRADO (fin de semana o pausa diaria de 17:00 a 18:00 Nueva York)"))
-    for key in ("london", "ny"):
+    for key in ("london", "ny", "tarde"):
         s = session_cfg(key, cfg)
         day = to_local(now, s["tz"]).date()
         o, cut, flat = bounds(day, s)
@@ -828,7 +833,7 @@ def cmd_clock(a, cfg):
             st = "sin entradas nuevas; fuera a las %s" % s["flat_by"]
         else:
             st = "terminada por hoy"
-        print("  %-11s %s-%s hora de %s: %s" % (s["name"], s["open"], s["flat_by"], TZ_NAMES[s["tz"]], st))
+        print("  %-26s %s-%s hora de %s: %s" % (s["name"], s["open"], s["flat_by"], TZ_NAMES[s["tz"]], st))
     print("Festivos: el oro suele cotizar con horario reducido en festivos de EE. UU. y del Reino Unido; mira el calendario de tu broker.")
     return 0
 
@@ -860,7 +865,8 @@ def cmd_plan(a, cfg):
             entry["opening_range"] = {"high": a.or_high, "low": a.or_low, "minutes": entry["or_minutes"]}
     else:
         entry = _need(os.path.join(TRADER, "gold-entry.json"), "ejecuta antes gold.py orb --write, o pasa --entry")
-    plan = make_plan(entry, a.stop, a.target, cfg)
+    target = a.target or session_cfg(entry.get("session") or a.session, cfg).get("target") or "2R"
+    plan = make_plan(entry, a.stop, target, cfg)
     print(json.dumps(plan, indent=2, ensure_ascii=False) if a.json else plan_report(plan))
     if a.write:
         _write(os.path.join(TRADER, "gold-plan.json"), plan)
@@ -898,6 +904,122 @@ def cmd_ticket(a, cfg):
     return 0
 
 
+# ---------------------------------------------------------------- diario (para probar en demo)
+
+def journal_path():
+    return os.path.join(TRADER, "gold-journal.json")
+
+
+def _utc(text):
+    return datetime.datetime.strptime(text.rstrip("Z")[:19], "%Y-%m-%dT%H:%M:%S")
+
+
+def journal_add(doc, plan, order, cfg):
+    if not plan.get("entry_utc"):
+        raise GoldError("el plan no viene de gold.py orb (no tiene la hora de entrada); el diario necesita una senal de orb")
+    trades = doc.setdefault("trades", [])
+    for t in trades:
+        if (t["date"], t["session"], t["side"], t["entry"]) == (plan["date"], plan["session"], plan["side"], plan["entry"]):
+            raise GoldError("esta senal ya esta en el diario (#%d)" % t["id"])
+    sess = session_cfg(plan["session"], cfg)
+    _, _, flat = bounds(datetime.date.fromisoformat(plan["date"]), sess)
+    lots = None
+    if order and abs(order.get("sl", 0) - plan["stop"]) < 1e-9 and abs(order.get("tp", 0) - plan["target"]) < 1e-9:
+        lots = order["volume"]
+    t = {"id": len(trades) + 1, "date": plan["date"], "session": plan["session"], "session_name": plan["session_name"],
+         "tz": plan["tz"], "side": plan["side"], "entry": plan["entry"], "entry_time": plan.get("entry_time"),
+         "entry_utc": plan["entry_utc"], "stop": plan["stop"], "target": plan["target"], "target_r": plan["target_r"],
+         "risk_per_oz": plan["risk_per_oz"], "lots": lots, "flat_by": sess["flat_by"],
+         "flat_utc": flat.isoformat() + "Z", "status": "abierta"}
+    trades.append(t)
+    return t
+
+
+def journal_check(doc, idx, now, cfg):
+    """Cierra las operaciones abiertas del diario con las velas: objetivo, stop (primero, si una vela toca los dos)
+    o la hora de cierre forzoso."""
+    contract, spread = float(cfg["contract_size"]), float(cfg["spread"])
+    changed = []
+    for t in doc.get("trades", []):
+        if t["status"] != "abierta":
+            continue
+        long = t["side"] == "long"
+        start, flat = _utc(t["entry_utc"]), _utc(t["flat_utc"])
+        out, px, at, last = None, None, None, None
+        b0 = start
+        while b0 < flat and b0 + FIVE <= now:
+            b = idx.get(b0)
+            if b is not None:
+                last = b
+                if (long and b[3] <= t["stop"]) or (not long and b[2] >= t["stop"]):
+                    out, px = "stop", t["stop"]
+                elif (long and b[2] >= t["target"]) or (not long and b[3] <= t["target"]):
+                    out, px = "objetivo", t["target"]
+                if out:
+                    at = b0 + FIVE
+                    break
+            b0 += FIVE
+        if out is None:
+            if now < flat or last is None:
+                continue
+            out, px, at = "cierre", last[4], last[0] + FIVE
+        sign = 1 if long else -1
+        r = t["target_r"] if out == "objetivo" else (-1.0 if out == "stop" else (px - t["entry"]) * sign / t["risk_per_oz"])
+        t.update(status=out, exit=round(px, 2), exit_time=hm(to_local(at, t["tz"])), r=round(r, 3))
+        if t.get("lots"):
+            t["usd"] = round((px - t["entry"]) * sign * t["lots"] * contract - spread * t["lots"] * contract, 2)
+        changed.append(t)
+    return changed
+
+
+def journal_report(doc):
+    trades = doc.get("trades", [])
+    if not trades:
+        return "El diario esta vacio. Apunta una senal con: gold.py journal add (despues de orb, plan y size)."
+    lines = ["Diario del oro (%d operaciones):" % len(trades),
+             "  #  fecha       sesion   lado   entrada   stop      objetivo  lotes  resultado            R       $"]
+    for t in trades:
+        res = t["status"] if t["status"] == "abierta" else "%s %s a %.2f" % (t["status"], t.get("exit_time", ""), t["exit"])
+        lines.append("  %-2d %s  %-7s  %-5s  %8.2f  %8.2f  %8.2f  %5s  %-19s %6s  %7s" % (
+            t["id"], t["date"], t["session"], "largo" if t["side"] == "long" else "corto", t["entry"], t["stop"],
+            t["target"], "%.2f" % t["lots"] if t.get("lots") else "-", res,
+            "%+.2f" % t["r"] if "r" in t else "", "%+.2f" % t["usd"] if "usd" in t else ""))
+    done = [t for t in trades if t["status"] != "abierta"]
+    if done:
+        wins = sum(1 for t in done if t["r"] > 0)
+        lines.append("Cerradas %d: %d ganadoras, %d perdedoras (%.0f %% de acierto). R total %+.2f, R media %+.2f." % (
+            len(done), wins, len(done) - wins, 100.0 * wins / len(done), sum(t["r"] for t in done),
+            sum(t["r"] for t in done) / len(done)))
+        usd = [t["usd"] for t in done if "usd" in t]
+        if usd:
+            lines.append("Resultado en dolares (con spread, sin swap ni comisiones): %+.2f $." % sum(usd))
+        if len(done) < 30:
+            lines.append("Con menos de 30 operaciones el resultado dice poco: sigue apuntando.")
+    return "\n".join(lines)
+
+
+def cmd_journal(a, cfg):
+    path = journal_path()
+    doc = load_json(path) or {"trades": []}
+    if a.action == "add":
+        plan = _need(os.path.join(TRADER, "gold-plan.json"), "ejecuta antes gold.py orb --write y plan --write")
+        order = load_json(os.path.join(TRADER, "gold-order.json"))
+        t = journal_add(doc, plan, order, cfg)
+        _write(path, doc)
+        print("Apuntada #%d: %s %s en %.2f, stop %.2f, objetivo %.2f%s." % (
+            t["id"], t["session_name"], "largo" if t["side"] == "long" else "corto", t["entry"], t["stop"], t["target"],
+            ", %.2f lotes" % t["lots"] if t["lots"] else " (sin lotes: ejecuta size --write antes para tenerlos)"))
+        return 0
+    if a.action == "check":
+        if any(t["status"] == "abierta" for t in doc.get("trades", [])):
+            idx, _ = load_bars(a, cfg)
+            for t in journal_check(doc, idx, parse_now(a.now), cfg):
+                print("#%d cerrada: %s a las %s en %.2f (%+.2fR)." % (t["id"], t["status"], t["exit_time"], t["exit"], t["r"]))
+            _write(path, doc)
+    print(journal_report(doc))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gold.py", description="Day trading de oro (XAUUSD) para MetaTrader 5.")
     p.add_argument("--config", help="configuracion (por defecto trader/gold.json)")
@@ -921,7 +1043,7 @@ def main(argv=None):
     data_opts(sp)
     sp = sub.add_parser("plan")
     sp.add_argument("--stop", default="or-mid")
-    sp.add_argument("--target", default="2R")
+    sp.add_argument("--target", help="2R, 1R, price:X (por defecto, el de la sesion: 2R Londres y NY, 1R tarde)")
     sp.add_argument("--entry", type=float)
     sp.add_argument("--side", choices=["long", "short"])
     sp.add_argument("--session", default="london", choices=sorted(SESSIONS))
@@ -949,6 +1071,10 @@ def main(argv=None):
     sp.add_argument("--write", action="store_true")
     sp.add_argument("--json", action="store_true")
     sub.add_parser("ticket")
+    sp = sub.add_parser("journal")
+    sp.add_argument("action", choices=["add", "check", "show"])
+    sp.add_argument("--now")
+    data_opts(sp)
 
     a = p.parse_args(argv)
     if not a.cmd:
@@ -957,7 +1083,7 @@ def main(argv=None):
     try:
         cfg = load_config(a.config)
         return {"clock": cmd_clock, "orb": cmd_orb, "plan": cmd_plan, "replay": cmd_replay,
-                "size": cmd_size, "ticket": cmd_ticket}[a.cmd](a, cfg)
+                "size": cmd_size, "ticket": cmd_ticket, "journal": cmd_journal}[a.cmd](a, cfg)
     except GoldError as e:
         print("No se pudo: %s" % e, file=sys.stderr)
         return 2
