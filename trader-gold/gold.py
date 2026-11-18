@@ -1045,7 +1045,7 @@ def prop_report(st):
         lines.append("  Abiertas, al stop        %10.2f $" % -st["open_risk"])
     if st.get("risk_usd"):
         lines.append("  Riesgo por operacion     %10.2f $   %s" % (st["risk_usd"], "REDUCIDO a la mitad: el saldo ha caido un 5 %"
-                                                                   if st["halved"] else "el %% del saldo inicial que elegiste"))
+                                                                   if st["halved"] else "el % del saldo inicial que elegiste"))
     lines.append("  Puedes arriesgar hoy     %10.2f $   como mucho, en la siguiente operacion" % st["room_today"])
     if st["phase"] == 3:
         lines.append("Cuenta FTMO: en XAUUSD nada puede ejecutarse (entrada, SL ni TP) de 2 minutos antes a 2 despues de "
