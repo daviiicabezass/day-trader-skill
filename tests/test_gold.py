@@ -149,6 +149,19 @@ class Orb(unittest.TestCase):
         self.assertEqual((doc["status"], doc["side"], doc["entry"]), ("triggered", "short", 2647.5))
         self.assertEqual(g.orb(idx, self.lon, DAY, now, side="long")["status"], "waiting")
 
+    def test_no_entry_limit_by_default_late_breakout_still_counts(self):
+        # velas dentro del rango hasta las 11:35 y luego una ruptura a las 11:40: sin limite, cuenta
+        idx = session_idx(DAY, self.lon, [2653.0] * 40 + [2660.0], RANGE)
+        doc = g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 12:00 london"))
+        self.assertEqual((doc["status"], doc["side"], doc["entry_time"]), ("triggered", "long", "11:40"))
+        self.assertEqual(self.lon["no_entries_after"], "15:55")
+
+    def test_a_limit_in_the_config_still_works(self):
+        cfg = dict(g.DEFAULTS, sessions={"london": {"no_entries_after": "11:00"}})
+        lon = g.session_cfg("london", cfg)
+        idx = session_idx(DAY, lon, [2653.0] * 40 + [2660.0], RANGE)
+        self.assertEqual(g.orb(idx, lon, DAY, g.parse_now("2026-10-19 12:00 london"))["status"], "expired")
+
     def test_a_bar_counts_only_once_closed(self):
         idx = session_idx(DAY, self.lon, [2653.0, 2656.0], RANGE)
         self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 08:24 london"))["status"], "waiting")
@@ -158,7 +171,8 @@ class Orb(unittest.TestCase):
         idx = session_idx(DAY, self.lon, [2653.0] * 60, RANGE)
         self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 07:59 london"))["status"], "not_open")
         self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 08:10 london"))["status"], "forming")
-        self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 12:00 london"))["status"], "expired")
+        self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 12:00 london"))["status"], "waiting")
+        self.assertEqual(g.orb(idx, self.lon, DAY, g.parse_now("2026-10-19 16:00 london"))["status"], "expired")
         sat = datetime.date(2026, 10, 17)
         self.assertEqual(g.orb(idx, self.lon, sat, g.parse_now("2026-10-17 09:00 london"))["status"], "closed")
         self.assertEqual(g.orb({}, self.lon, DAY, g.parse_now("2026-10-19 09:00 london"))["status"], "no_data")
@@ -330,7 +344,7 @@ class Tarde(unittest.TestCase):
     def test_afternoon_session_is_spain_15_30_to_20_00_in_winter(self):
         s = g.session_cfg("tarde", g.DEFAULTS)
         o, cut, flat = g.bounds(datetime.date(2026, 11, 16), s)
-        self.assertEqual((o, cut, flat), (D(2026, 11, 16, 14, 30), D(2026, 11, 16, 17, 30), D(2026, 11, 16, 18, 55)))
+        self.assertEqual((o, cut, flat), (D(2026, 11, 16, 14, 30), D(2026, 11, 16, 18, 50), D(2026, 11, 16, 18, 55)))
         self.assertEqual(s["target"], "1R")
 
 

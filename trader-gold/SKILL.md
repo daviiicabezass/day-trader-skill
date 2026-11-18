@@ -48,9 +48,9 @@ python3 "${CLAUDE_SKILL_DIR}/gold.py" backtest --session tarde --compare     # f
 
 | sesión | rango de apertura | entradas hasta | fuera a las | objetivo por defecto |
 | --- | --- | --- | --- | --- |
-| `london` | 08:00-08:15 Londres | 11:00 Londres | 16:00 Londres | 1R |
-| `ny` | 08:20-08:35 Nueva York | 11:30 Nueva York | 13:25 Nueva York | 2R |
-| `tarde` | 09:30-09:45 Nueva York (15:30-15:45 en España) | 12:30 NY (18:30 España) | 13:55 NY (19:55 España) | 1R |
+| `london` | 08:00-08:15 Londres | 15:55 Londres (sin límite) | 16:00 Londres | 1R |
+| `ny` | 08:20-08:35 Nueva York | 13:20 Nueva York (sin límite) | 13:25 Nueva York | 2R |
+| `tarde` | 09:30-09:45 Nueva York (15:30-15:45 en España) | 13:50 NY (19:50 España, sin límite) | 13:55 NY (19:55 España) | 1R |
 
 `tarde` sigue el horario de Nueva York: las pocas semanas al año en que EE. UU.
 y Europa cambian de hora en fechas distintas (marzo y finales de octubre) en
@@ -112,7 +112,7 @@ Todo es opcional; estos son los valores por defecto:
   "symbol": "XAUUSD", "contract_size": 100, "lot_min": 0.01, "lot_step": 0.01, "lot_max": 5.0,
   "balance": 5000, "max_loss_usd": 50, "leverage": 100, "spread": 0.30, "cash_buffer_pct": 10,
   "min_reward_risk": 1.0, "or_minutes": 15, "server_tz": "ny+7", "yahoo_symbol": "GC=F", "basis": 0,
-  "sessions": {"london": {"open": "08:00", "no_entries_after": "11:00", "flat_by": "16:00"},
+  "sessions": {"london": {"open": "08:00", "flat_by": "16:00"},
                "ny": {"open": "08:20", "no_entries_after": "11:30", "flat_by": "13:25"}}
 }
 ```
@@ -133,7 +133,7 @@ verano de cada ciudad se calcula en la herramienta.
   que CIERRA por encima del máximo (largo) o por debajo del mínimo (corto).
   `--side long` o `--side short` limita a un lado. La hora es el cierre de esa
   vela. Una mecha no cuenta.
-- **Entradas** solo hasta `no_entries_after`; después, el setup caduca.
+- **Sin hora límite de entrada** por defecto: vale la primera ruptura hasta la última vela antes de `flat_by`. Cuanto más tarde, menos tiempo queda para el objetivo: mira la Time Machine. Para poner un límite, `"no_entries_after": "HH:MM"` en la sesión (en el ejemplo, `ny` lo tiene y `london` no).
 - **El stop**: `or-mid` (punto medio del rango, por defecto), `or-opposite`
   (el otro extremo), `price:X` o `usd:X` (X dólares desde la entrada). Se
   redondea alejándose de la entrada. Se rechaza un stop de menos de 3 veces el

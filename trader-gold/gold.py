@@ -23,8 +23,11 @@ Datos:
 Las velas de 1 minuto se agrupan en velas de 5 minutos.
 
 Sesiones (configurables en trader/gold.json, "sessions"):
-  london  apertura 08:00 hora de Londres, entradas hasta 11:00, fuera a las 16:00
-  ny      apertura 08:20 hora de Nueva York (COMEX), entradas hasta 11:30, fuera a las 13:25
+  london  apertura 08:00 hora de Londres, fuera a las 16:00
+  ny      apertura 08:20 hora de Nueva York (COMEX), fuera a las 13:25
+  tarde   apertura 09:30 hora de Nueva York (15:30 Espana), fuera a las 13:55
+Sin hora limite de entrada: vale la primera ruptura hasta la ultima vela antes del cierre forzoso.
+Para poner una, "no_entries_after": "HH:MM" en la sesion de trader/gold.json.
 El horario de verano de Londres (ultimo domingo de marzo a ultimo domingo de octubre, 01:00 UTC)
 y de Nueva York (segundo domingo de marzo a primer domingo de noviembre) se calcula aqui.
 """
@@ -68,12 +71,12 @@ DEFAULTS = {
 }
 
 SESSIONS = {
-    "london": {"name": "Londres", "tz": "london", "open": "08:00", "no_entries_after": "11:00", "flat_by": "16:00",
+    "london": {"name": "Londres", "tz": "london", "open": "08:00", "no_entries_after": None, "flat_by": "16:00",
                "target": "1R", "trend_filter": True, "width_filter": False},
-    "ny": {"name": "Nueva York", "tz": "ny", "open": "08:20", "no_entries_after": "11:30", "flat_by": "13:25",
+    "ny": {"name": "Nueva York", "tz": "ny", "open": "08:20", "no_entries_after": None, "flat_by": "13:25",
            "target": "2R", "trend_filter": True, "width_filter": False},
     # la tarde europea: de la apertura de la bolsa de EE. UU. (15:30 en Espana) a las 20:00 de Espana
-    "tarde": {"name": "Tarde (15:30-20:00 Espana)", "tz": "ny", "open": "09:30", "no_entries_after": "12:30",
+    "tarde": {"name": "Tarde (15:30-20:00 Espana)", "tz": "ny", "open": "09:30", "no_entries_after": None,
               "flat_by": "13:55", "target": "1R", "trend_filter": True, "width_filter": False},
 }
 TZ_NAMES = {"ny": "Nueva York", "london": "Londres", "utc": "UTC"}
@@ -193,6 +196,10 @@ def session_cfg(name, cfg):
     s = dict(SESSIONS[name])
     s.update((cfg.get("sessions") or {}).get(name, {}))
     s["key"] = name
+    if not s.get("no_entries_after"):
+        # sin hora limite: vale cualquier ruptura hasta la ultima vela antes del cierre forzoso
+        f = datetime.datetime.combine(datetime.date(2000, 1, 3), parse_hm(s["flat_by"])) - FIVE
+        s["no_entries_after"] = f.strftime("%H:%M")
     for k in ("open", "no_entries_after", "flat_by"):
         parse_hm(s[k])
     return s
