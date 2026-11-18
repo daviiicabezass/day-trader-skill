@@ -68,6 +68,23 @@ DEFAULTS = {
     "yahoo_symbol": "GC=F",
     "basis": 0.0,
     "sessions": {},
+    "prop": None,                # reglas de una cuenta de fondeo (FTMO...): ver PROP_FTMO_2STEP y gold.py prop
+}
+
+# FTMO 2-Step (Challenge y Verification), segun ftmo.com en noviembre de 2026. Compruebalo en tu panel.
+PROP_FTMO_2STEP = {
+    "name": "FTMO 2-Step",
+    "initial_balance": 10000.0,
+    "phase": 1,                  # 1 = FTMO Challenge (objetivo 10 %), 2 = Verification (5 %), 3 = cuenta FTMO
+    "start_date": None,          # AAAA-MM-DD: solo cuentan las operaciones del diario desde ese dia
+    "profit_target_pct": {"1": 10.0, "2": 5.0, "3": None},
+    "max_daily_loss_pct": 5.0,   # del saldo inicial, desde el saldo a medianoche (hora de Praga = Espana)
+    "max_loss_pct": 10.0,        # estatico: el equity nunca por debajo del 90 % del saldo inicial
+    "min_trading_days": 4,
+    # tus frenos, mas estrictos que FTMO, para no acercarte nunca a sus limites
+    "daily_stop_usd": 150.0,     # deja de operar hoy si pierdes esto
+    "max_losses_per_day": 2,     # o despues de 2 stops
+    "safety_usd": 50.0,          # margen extra frente a los limites de FTMO
 }
 
 SESSIONS = {
@@ -79,7 +96,7 @@ SESSIONS = {
     "tarde": {"name": "Tarde (15:30-20:00 Espana)", "tz": "ny", "open": "09:30", "no_entries_after": None,
               "flat_by": "13:55", "target": "1R", "trend_filter": True, "width_filter": False},
 }
-TZ_NAMES = {"ny": "Nueva York", "london": "Londres", "utc": "UTC"}
+TZ_NAMES = {"ny": "Nueva York", "london": "Londres", "utc": "UTC", "cet": "Espana"}
 
 
 class GoldError(Exception):
@@ -114,8 +131,13 @@ def london_offset(utc):
     return 1 if start <= utc < end else 0
 
 
-OFFSETS = {"ny": ny_offset, "london": london_offset, "utc": lambda utc: 0}
-CANDIDATES = {"ny": (-4, -5), "london": (1, 0), "utc": (0,)}
+def cet_offset(utc):
+    """Hora de Praga y de Espana: la de Londres mas una (mismo cambio de horario en la UE y el Reino Unido)."""
+    return london_offset(utc) + 1
+
+
+OFFSETS = {"ny": ny_offset, "london": london_offset, "utc": lambda utc: 0, "cet": cet_offset}
+CANDIDATES = {"ny": (-4, -5), "london": (1, 0), "utc": (0,), "cet": (2, 1)}
 
 
 def to_local(utc, tz):
@@ -143,8 +165,8 @@ def parse_now(text):
         return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
     parts = text.split()
     zone = "ny"
-    if parts and parts[-1].lower() in ("ny", "london", "londres", "utc"):
-        zone = {"londres": "london"}.get(parts[-1].lower(), parts[-1].lower())
+    if parts and parts[-1].lower() in ("ny", "london", "londres", "utc", "cet", "espana"):
+        zone = {"londres": "london", "espana": "cet"}.get(parts[-1].lower(), parts[-1].lower())
         parts = parts[:-1]
     try:
         local = datetime.datetime.strptime(" ".join(parts), "%Y-%m-%d %H:%M")
@@ -933,7 +955,82 @@ def compare_report(rows, sess):
 
 # ---------------------------------------------------------------- tamano en lotes
 
-def size_order(plan, cfg):
+def prop_cfg(cfg):
+    pr = cfg.get("prop")
+    if not pr:
+        return None
+    out = dict(PROP_FTMO_2STEP)
+    out.update(pr)
+    return out
+
+
+def prop_status(trades, cfg, now):
+    """Estado de la cuenta de fondeo a partir del diario: saldo, limite diario, perdida maxima, objetivo, dias."""
+    pr = prop_cfg(cfg)
+    if pr is None:
+        return None
+    init = float(pr["initial_balance"])
+    start = pr.get("start_date")
+    contract, spread = float(cfg["contract_size"]), float(cfg["spread"])
+    today = to_local(now, "cet").date()
+    mine = [t for t in trades if not start or t["date"] >= start]
+    closed = [t for t in mine if t["status"] != "abierta" and "usd" in t]
+    day_of = lambda t: to_local(_utc(t["entry_utc"]), "cet").date()
+    before = sum(t["usd"] for t in closed if day_of(t) < today)
+    today_closed = [t for t in closed if day_of(t) == today]
+    today_pnl = sum(t["usd"] for t in today_closed)
+    open_risk = sum(t["lots"] * (t["risk_per_oz"] + spread) * contract for t in mine
+                    if t["status"] == "abierta" and t.get("lots"))
+    balance = init + before + today_pnl
+    midnight = init + before
+    daily_floor = midnight - init * float(pr["max_daily_loss_pct"]) / 100.0
+    total_floor = init * (1 - float(pr["max_loss_pct"]) / 100.0)
+    tgt_pct = pr["profit_target_pct"].get(str(pr["phase"])) if isinstance(pr["profit_target_pct"], dict) else pr["profit_target_pct"]
+    target = init * (1 + tgt_pct / 100.0) if tgt_pct else None
+    days = sorted(set(day_of(t) for t in mine))
+    losses_today = sum(1 for t in today_closed if t["usd"] < 0)
+    safety = float(pr["safety_usd"])
+    # lo que aun puedes perder hoy sin tocar ni el limite de FTMO ni tu propio freno, contando las abiertas al stop
+    room_ftmo = balance - open_risk - max(daily_floor, total_floor) - safety
+    room_own = float(pr["daily_stop_usd"]) + min(today_pnl, 0) - open_risk if pr.get("daily_stop_usd") else room_ftmo
+    room = max(0.0, min(room_ftmo, room_own))
+    blocks = []
+    if pr.get("max_losses_per_day") and losses_today >= int(pr["max_losses_per_day"]):
+        blocks.append("ya llevas %d stops hoy (tu freno: %d). Hoy no se opera mas." % (losses_today, pr["max_losses_per_day"]))
+    if pr.get("daily_stop_usd") and -today_pnl >= float(pr["daily_stop_usd"]) - 1e-9:
+        blocks.append("hoy pierdes %.2f $ (tu freno diario: %.2f $). Hoy no se opera mas." % (-today_pnl, pr["daily_stop_usd"]))
+    if target and balance >= target:
+        blocks.append("objetivo de la fase cumplido (%.2f $). No arriesgues mas: solo te faltan los dias minimos." % target)
+    return {"name": pr["name"], "phase": pr["phase"], "initial": init, "balance": round(balance, 2),
+            "midnight_balance": round(midnight, 2), "today": today.isoformat(), "today_pnl": round(today_pnl, 2),
+            "losses_today": losses_today, "open_risk": round(open_risk, 2),
+            "daily_floor": round(daily_floor, 2), "total_floor": round(total_floor, 2),
+            "target": round(target, 2) if target else None, "to_target": round(target - balance, 2) if target else None,
+            "trading_days": len(days), "min_trading_days": pr["min_trading_days"],
+            "room_today": round(room, 2), "blocks": blocks}
+
+
+def prop_report(st):
+    ph = {1: "fase 1, FTMO Challenge", 2: "fase 2, Verification", 3: "cuenta FTMO"}.get(st["phase"], "fase %s" % st["phase"])
+    lines = ["%s (%s), %.0f $ iniciales. Dia FTMO: %s (empieza a medianoche, hora de Espana)." % (
+        st["name"], ph, st["initial"], st["today"]),
+        "  Saldo (segun el diario)  %10.2f $   hoy %+.2f $, %d stops" % (st["balance"], st["today_pnl"], st["losses_today"]),
+        "  Limite diario FTMO       %10.2f $   el equity no puede bajar de aqui hoy (saldo a medianoche %.2f - 5 %%)" % (
+            st["daily_floor"], st["midnight_balance"]),
+        "  Perdida maxima FTMO      %10.2f $   estatica, nunca por debajo" % st["total_floor"]]
+    if st["target"]:
+        lines.append("  Objetivo                 %10.2f $   faltan %.2f $" % (st["target"], max(st["to_target"], 0)))
+    lines.append("  Dias operados            %10d     minimo %d" % (st["trading_days"], st["min_trading_days"]))
+    if st["open_risk"]:
+        lines.append("  Abiertas, al stop        %10.2f $" % -st["open_risk"])
+    lines.append("  Puedes arriesgar hoy     %10.2f $   como mucho, en la siguiente operacion" % st["room_today"])
+    for b in st["blocks"]:
+        lines.append("ALTO: " + b)
+    lines.append("El saldo sale del diario (con spread, sin comisiones ni swap): compruebalo con el de tu panel de FTMO.")
+    return "\n".join(lines)
+
+
+def size_order(plan, cfg, room=None):
     e, stop, tgt = float(plan["entry"]), float(plan["stop"]), float(plan["target"])
     contract, spread = float(cfg["contract_size"]), float(cfg["spread"])
     step, lmin, lmax = float(cfg["lot_step"]), float(cfg["lot_min"]), float(cfg["lot_max"])
@@ -950,9 +1047,15 @@ def size_order(plan, cfg):
          "%.2f $ disponibles / %.2f $ de margen por lote (apalancamiento 1:%g)" % (equity, margin_lot, float(cfg["leverage"]))),
         ("lote maximo", lmax, "lot_max en la configuracion"),
     ]
+    if room is not None:
+        limits.append(("limite FTMO hoy", floor_step(room / risk_lot, step),
+                       "%.2f $ que aun puedes perder hoy / %.2f $ por lote al stop" % (room, risk_lot)))
     lots = min(x[1] for x in limits)
     decided = [x[0] for x in limits if x[1] == lots][0]
     if lots < lmin - 1e-9:
+        if decided == "limite FTMO hoy":
+            raise GoldError("no cabe ni el lote minimo dentro de lo que aun puedes perder hoy (%.2f $). "
+                            "Salta la operacion: gold.py prop te dice por que." % room)
         raise GoldError("ni el lote minimo cabe: %.2f lotes arriesgan %.2f $ en el stop (con spread), mas que tu "
                         "perdida maxima de %.2f $. Usa un stop mas cercano o salta la operacion."
                         % (lmin, lmin * risk_lot, float(cfg["max_loss_usd"])))
@@ -1117,7 +1220,10 @@ def cmd_size(a, cfg):
         v = getattr(a, k)
         if v is not None:
             cfg["max_loss_usd" if k == "max_loss" else k] = v
-    o = size_order(plan, cfg)
+    st = prop_status((load_json(journal_path()) or {}).get("trades", []), cfg, parse_now(getattr(a, "now", None)))
+    if st and st["blocks"]:
+        raise GoldError("cuenta de fondeo: " + " ".join(st["blocks"]))
+    o = size_order(plan, cfg, room=st["room_today"] if st else None)
     print(json.dumps(o, indent=2, ensure_ascii=False) if a.json else size_report(o))
     if a.write:
         _write(os.path.join(TRADER, "gold-order.json"), o)
@@ -1266,6 +1372,15 @@ def cmd_journal(a, cfg):
     return 0
 
 
+def cmd_prop(a, cfg):
+    if not cfg.get("prop"):
+        raise GoldError('no hay cuenta de fondeo en la configuracion: pon "prop": {"initial_balance": 10000, '
+                        '"phase": 1, "start_date": "AAAA-MM-DD"} en trader/gold.json')
+    st = prop_status((load_json(journal_path()) or {}).get("trades", []), cfg, parse_now(a.now))
+    print(json.dumps(st, indent=2, ensure_ascii=False) if a.json else prop_report(st))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gold.py", description="Day trading de oro (XAUUSD) para MetaTrader 5.")
     p.add_argument("--config", help="configuracion (por defecto trader/gold.json)")
@@ -1330,9 +1445,13 @@ def main(argv=None):
     sp.add_argument("--max-loss", type=float)
     sp.add_argument("--leverage", type=float)
     sp.add_argument("--spread", type=float)
+    sp.add_argument("--now")
     sp.add_argument("--write", action="store_true")
     sp.add_argument("--json", action="store_true")
     sub.add_parser("ticket")
+    sp = sub.add_parser("prop")
+    sp.add_argument("--now")
+    sp.add_argument("--json", action="store_true")
     sp = sub.add_parser("journal")
     sp.add_argument("action", choices=["add", "check", "show"])
     sp.add_argument("--now")
@@ -1346,7 +1465,7 @@ def main(argv=None):
         cfg = load_config(a.config)
         return {"clock": cmd_clock, "orb": cmd_orb, "plan": cmd_plan, "replay": cmd_replay,
                 "size": cmd_size, "ticket": cmd_ticket, "journal": cmd_journal,
-                "backtest": cmd_backtest}[a.cmd](a, cfg)
+                "backtest": cmd_backtest, "prop": cmd_prop}[a.cmd](a, cfg)
     except GoldError as e:
         print("No se pudo: %s" % e, file=sys.stderr)
         return 2

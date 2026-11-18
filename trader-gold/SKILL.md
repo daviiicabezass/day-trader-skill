@@ -103,6 +103,30 @@ salida 2.
 Las velas de 1 minuto se agrupan en velas de 5 minutos. El tick en vivo nunca
 cuenta como vela, y una vela solo cuenta cuando ha cerrado.
 
+## Cuenta de fondeo (FTMO 2-Step)
+
+Con `"prop"` en `trader/gold.json`, la skill opera dentro de las normas de la cuenta:
+
+```json
+{"balance": 10000, "max_loss_usd": 50, "leverage": 50,
+ "prop": {"name": "FTMO 2-Step 10k", "initial_balance": 10000, "phase": 1, "start_date": "2026-11-19",
+          "daily_stop_usd": 150, "max_losses_per_day": 2, "safety_usd": 50}}
+```
+
+| norma FTMO 2-Step | valor | qué hace la skill |
+| --- | --- | --- |
+| Objetivo | 10 % fase 1, 5 % fase 2 | `prop` dice cuánto falta; al llegar, bloquea nuevas operaciones |
+| Pérdida diaria máxima | 5 % del saldo inicial, desde el saldo a medianoche (hora de Praga = España), contando lo flotante | `size` nunca deja que la pérdida al stop, más las abiertas, pase de ahí |
+| Pérdida máxima | 10 %, estática (equity nunca por debajo de 9.000 $ en 10k) | igual, con `safety_usd` de margen |
+| Días mínimos | 4 | `prop` los cuenta |
+| Noticias | libres en Challenge y Verification; en la cuenta FTMO (Standard), en XAUUSD nada se ejecuta (ni SL ni TP) de 2 minutos antes a 2 después de una noticia marcada | aviso: en la cuenta FTMO, evita tener el stop o el objetivo cerca del precio a las 14:30 o las 16:00 de España |
+| Apalancamiento XAUUSD | 1:50 Standard, 1:15 Swing (desde el 1 de febrero de 2026) | `"leverage": 50` |
+| Fin de semana | en Standard no se deja nada abierto: la skill cierra todo en el día | ya lo hace (`flat_by`) |
+
+Además, tus frenos, más estrictos que FTMO: deja de operar el día tras 2 stops o 150 $ de pérdida.
+`python3 trader-gold/gold.py prop` enseña el saldo según el diario, los límites de hoy, el objetivo y los días.
+El saldo sale del diario (con spread, sin comisiones ni swap): compruébalo siempre con el panel de FTMO.
+
 ## La configuración: `trader/gold.json`
 
 Todo es opcional; estos son los valores por defecto:

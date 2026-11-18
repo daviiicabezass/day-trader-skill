@@ -428,3 +428,60 @@ class Filters(unittest.TestCase):
         rows = g.compare(idx, tarde, g.DEFAULTS)
         self.assertEqual(len(rows), 12)
         self.assertIn("tendencia+anchura", g.compare_report(rows, tarde))
+
+
+class Prop(unittest.TestCase):
+    """Reglas de FTMO 2-Step con el diario: limite diario desde el saldo a medianoche (hora de Espana)."""
+
+    def cfg(self, **kw):
+        pr = {"initial_balance": 10000.0, "phase": 1, "start_date": "2026-11-19"}
+        pr.update(kw)
+        return dict(g.DEFAULTS, prop=pr)
+
+    def trade(self, day, hh, usd, status="stop", lots=0.05, risk=10.0):
+        return {"date": day, "entry_utc": "%sT%s:00Z" % (day, hh), "status": status, "usd": usd,
+                "lots": lots, "risk_per_oz": risk}
+
+    def test_no_prop_means_no_limit(self):
+        self.assertIsNone(g.prop_status([], g.DEFAULTS, g.parse_now("2026-11-19 10:00 utc")))
+
+    def test_floors_target_and_days(self):
+        trades = [self.trade("2026-11-18", "13:00", -500.0),          # antes de start_date: no cuenta
+                  self.trade("2026-11-19", "09:00", 100.0, "objetivo"),
+                  self.trade("2026-11-20", "09:00", -50.0)]
+        st = g.prop_status(trades, self.cfg(), g.parse_now("2026-11-20 12:00 utc"))
+        self.assertEqual((st["balance"], st["midnight_balance"]), (10050.0, 10100.0))
+        self.assertEqual((st["daily_floor"], st["total_floor"], st["target"]), (9600.0, 9000.0, 11000.0))
+        self.assertEqual((st["trading_days"], st["losses_today"], st["today_pnl"]), (2, 1, -50.0))
+        self.assertEqual(st["room_today"], 100.0)                     # tu freno de 150 $ menos los 50 perdidos
+        self.assertEqual(st["blocks"], [])
+
+    def test_ftmo_day_starts_at_spain_midnight(self):
+        # 23:30 UTC del 19 es ya el dia 20 en Espana (UTC+1 en invierno)
+        trades = [self.trade("2026-11-19", "23:30", -60.0)]
+        st = g.prop_status(trades, self.cfg(), g.parse_now("2026-11-20 08:00 utc"))
+        self.assertEqual((st["today"], st["today_pnl"]), ("2026-11-20", -60.0))
+
+    def test_two_stops_block_the_day_and_size_refuses(self):
+        trades = [self.trade("2026-11-19", "09:00", -50.0), self.trade("2026-11-19", "14:00", -50.0)]
+        st = g.prop_status(trades, self.cfg(), g.parse_now("2026-11-19 15:00 utc"))
+        self.assertEqual(len(st["blocks"]), 1)
+        self.assertIn("2 stops", st["blocks"][0])
+
+    def test_open_trade_risk_counts_and_caps_the_lots(self):
+        open_t = self.trade("2026-11-19", "09:00", 0.0, "abierta", lots=0.10, risk=9.7)
+        del open_t["usd"]
+        st = g.prop_status([open_t], self.cfg(), g.parse_now("2026-11-19 10:00 utc"))
+        self.assertEqual(st["open_risk"], 100.0)                      # 0,10 lotes x (9,70 + 0,30) x 100
+        self.assertEqual(st["room_today"], 50.0)
+        plan = {"entry": 3800.0, "stop": 3810.0, "target": 3790.0, "side": "short", "reward_risk": 1.0}
+        o = g.size_order(plan, dict(g.DEFAULTS, max_loss_usd=100.0), room=st["room_today"])
+        self.assertEqual((o["volume"], o["decided_by"]), (0.04, "limite FTMO hoy"))
+
+    def test_target_reached_stops_risk(self):
+        st = g.prop_status([self.trade("2026-11-19", "09:00", 1000.0, "objetivo")], self.cfg(),
+                           g.parse_now("2026-11-20 09:00 utc"))
+        self.assertIn("objetivo de la fase cumplido", st["blocks"][0])
+        st2 = g.prop_status([self.trade("2026-11-19", "09:00", 520.0, "objetivo")], self.cfg(phase=2),
+                            g.parse_now("2026-11-20 09:00 utc"))
+        self.assertEqual(st2["target"], 10500.0)
