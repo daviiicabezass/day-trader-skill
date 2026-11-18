@@ -485,3 +485,36 @@ class Prop(unittest.TestCase):
         st2 = g.prop_status([self.trade("2026-11-19", "09:00", 520.0, "objetivo")], self.cfg(phase=2),
                             g.parse_now("2026-11-20 09:00 utc"))
         self.assertEqual(st2["target"], 10500.0)
+
+
+class PropRules(unittest.TestCase):
+    def cfg(self, **kw):
+        pr = {"initial_balance": 10000.0, "phase": 1, "start_date": "2026-11-19", "risk_pct": 1.0, "daily_stop_usd": 200}
+        pr.update(kw)
+        return dict(g.DEFAULTS, prop=pr)
+
+    def t(self, day, usd, status="stop"):
+        return {"date": day, "entry_utc": day + "T09:00:00Z", "status": status, "usd": usd, "lots": 0.1, "risk_per_oz": 9.7}
+
+    def test_one_percent_and_halved_after_five_percent_down(self):
+        st = g.prop_status([], self.cfg(), g.parse_now("2026-11-19 08:00 utc"))
+        self.assertEqual((st["risk_usd"], st["halved"]), (100.0, False))
+        down = [self.t("2026-11-19", -250.0), self.t("2026-11-20", -250.0)]
+        st = g.prop_status(down, self.cfg(), g.parse_now("2026-11-23 08:00 utc"))
+        self.assertEqual((st["balance"], st["risk_usd"], st["halved"]), (9500.0, 50.0, True))
+
+    def test_one_open_trade_at_a_time(self):
+        st = g.prop_status([self.t("2026-11-19", 0.0, "abierta")], self.cfg(), g.parse_now("2026-11-19 10:00 utc"))
+        self.assertIn("abierta", st["blocks"][0])
+
+    def test_no_new_entries_late_friday(self):
+        st = g.prop_status([], self.cfg(), g.parse_now("2026-11-20 18:45 utc"))   # viernes 19:45 en Espana
+        self.assertIn("viernes", st["blocks"][0])
+        st = g.prop_status([], self.cfg(), g.parse_now("2026-11-20 17:00 utc"))
+        self.assertEqual(st["blocks"], [])
+
+    def test_commission_counts_in_the_lots(self):
+        plan = {"entry": 3800.0, "stop": 3810.0, "target": 3790.0, "side": "short", "reward_risk": 1.0}
+        o = g.size_order(plan, dict(g.DEFAULTS, max_loss_usd=100.0, commission_per_lot=7.0))
+        self.assertEqual(o["volume"], 0.09)          # 100 / (10,30 x 100 + 7) = 0,0964
+        self.assertEqual(o["max_loss_usd"], 93.33)

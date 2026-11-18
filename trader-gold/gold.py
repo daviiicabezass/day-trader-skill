@@ -85,6 +85,11 @@ PROP_FTMO_2STEP = {
     "daily_stop_usd": 150.0,     # deja de operar hoy si pierdes esto
     "max_losses_per_day": 2,     # o despues de 2 stops
     "safety_usd": 50.0,          # margen extra frente a los limites de FTMO
+    "risk_pct": None,            # riesgo por operacion en % del saldo inicial (1 = 100 $ en 10k); manda sobre max_loss_usd
+    "halve_below_pct": 5.0,      # si el saldo cae un 5 % o mas, el riesgo se reduce a la mitad hasta recuperarse
+    "friday_no_entries_after_cet": "19:30",  # el oro cierra el viernes a las 22:00 de Espana: nada nuevo a menos de 2 h
+    "commission_per_lot": 0.0,   # ida y vuelta, en $ por lote: miralo en MT5 (Especificacion del simbolo)
+    "max_open_trades": 1,        # una sola operacion a la vez: nada de doblar el riesgo en la misma vela
 }
 
 SESSIONS = {
@@ -1001,7 +1006,22 @@ def prop_status(trades, cfg, now):
         blocks.append("hoy pierdes %.2f $ (tu freno diario: %.2f $). Hoy no se opera mas." % (-today_pnl, pr["daily_stop_usd"]))
     if target and balance >= target:
         blocks.append("objetivo de la fase cumplido (%.2f $). No arriesgues mas: solo te faltan los dias minimos." % target)
+    n_open = sum(1 for t in mine if t["status"] == "abierta")
+    if pr.get("max_open_trades") and n_open >= int(pr["max_open_trades"]):
+        blocks.append("ya tienes %d operacion abierta (maximo %d a la vez). Espera a que se cierre." % (n_open, pr["max_open_trades"]))
+    risk_usd = None
+    if pr.get("risk_pct"):
+        risk_usd = init * float(pr["risk_pct"]) / 100.0
+        if pr.get("halve_below_pct") and balance <= init * (1 - float(pr["halve_below_pct"]) / 100.0):
+            risk_usd /= 2.0
+    wd = to_local(now, "cet")
+    if wd.weekday() == 4 and pr.get("friday_no_entries_after_cet") and \
+            wd.time() >= parse_hm(pr["friday_no_entries_after_cet"]):
+        blocks.append("viernes despues de las %s (Espana): el oro cierra a las 22:00 para el fin de semana; FTMO "
+                      "prohibe abrir a menos de 2 horas de un cierre largo (gap trading)." % pr["friday_no_entries_after_cet"])
     return {"name": pr["name"], "phase": pr["phase"], "initial": init, "balance": round(balance, 2),
+            "risk_usd": round(risk_usd, 2) if risk_usd else None,
+            "halved": bool(risk_usd and pr.get("risk_pct") and risk_usd < init * float(pr["risk_pct"]) / 100.0 - 1e-9),
             "midnight_balance": round(midnight, 2), "today": today.isoformat(), "today_pnl": round(today_pnl, 2),
             "losses_today": losses_today, "open_risk": round(open_risk, 2),
             "daily_floor": round(daily_floor, 2), "total_floor": round(total_floor, 2),
@@ -1023,7 +1043,13 @@ def prop_report(st):
     lines.append("  Dias operados            %10d     minimo %d" % (st["trading_days"], st["min_trading_days"]))
     if st["open_risk"]:
         lines.append("  Abiertas, al stop        %10.2f $" % -st["open_risk"])
+    if st.get("risk_usd"):
+        lines.append("  Riesgo por operacion     %10.2f $   %s" % (st["risk_usd"], "REDUCIDO a la mitad: el saldo ha caido un 5 %"
+                                                                   if st["halved"] else "el %% del saldo inicial que elegiste"))
     lines.append("  Puedes arriesgar hoy     %10.2f $   como mucho, en la siguiente operacion" % st["room_today"])
+    if st["phase"] == 3:
+        lines.append("Cuenta FTMO: en XAUUSD nada puede ejecutarse (entrada, SL ni TP) de 2 minutos antes a 2 despues de "
+                     "una noticia marcada en el calendario de FTMO. Miralo antes de cada operacion.")
     for b in st["blocks"]:
         lines.append("ALTO: " + b)
     lines.append("El saldo sale del diario (con spread, sin comisiones ni swap): compruebalo con el de tu panel de FTMO.")
@@ -1037,7 +1063,8 @@ def size_order(plan, cfg, room=None):
     if plan.get("reward_risk", 0) + 1e-9 < float(cfg["min_reward_risk"]):
         raise GoldError("recompensa:riesgo %.2f por debajo de tu minimo %.2f" % (plan["reward_risk"], cfg["min_reward_risk"]))
     risk_oz = abs(e - stop) + spread
-    risk_lot = risk_oz * contract
+    commission = float(cfg.get("commission_per_lot") or 0)
+    risk_lot = risk_oz * contract + commission
     equity = float(cfg["balance"]) * (1 - float(cfg["cash_buffer_pct"]) / 100.0)
     margin_lot = contract * e / float(cfg["leverage"])
     limits = [
@@ -1060,7 +1087,7 @@ def size_order(plan, cfg, room=None):
                         "perdida maxima de %.2f $. Usa un stop mas cercano o salta la operacion."
                         % (lmin, lmin * risk_lot, float(cfg["max_loss_usd"])))
     max_loss = round(lots * risk_lot, 2)
-    reward = round(lots * (abs(tgt - e) - spread) * contract, 2)
+    reward = round(lots * ((abs(tgt - e) - spread) * contract - commission), 2)
     order = {"symbol": cfg["symbol"], "type": "buy" if plan["side"] == "long" else "sell", "volume": lots,
              "sl": stop, "tp": tgt, "entry_ref": e, "max_loss_usd": max_loss, "reward_usd": reward,
              "margin_usd": round(lots * margin_lot, 2), "decided_by": decided,
@@ -1220,9 +1247,14 @@ def cmd_size(a, cfg):
         v = getattr(a, k)
         if v is not None:
             cfg["max_loss_usd" if k == "max_loss" else k] = v
+    pr = prop_cfg(cfg)
+    if pr and pr.get("commission_per_lot") and not cfg.get("commission_per_lot"):
+        cfg["commission_per_lot"] = pr["commission_per_lot"]
     st = prop_status((load_json(journal_path()) or {}).get("trades", []), cfg, parse_now(getattr(a, "now", None)))
     if st and st["blocks"]:
         raise GoldError("cuenta de fondeo: " + " ".join(st["blocks"]))
+    if st and st.get("risk_usd") and a.max_loss is None:
+        cfg["max_loss_usd"] = st["risk_usd"]
     o = size_order(plan, cfg, room=st["room_today"] if st else None)
     print(json.dumps(o, indent=2, ensure_ascii=False) if a.json else size_report(o))
     if a.write:
@@ -1319,7 +1351,8 @@ def journal_check(doc, idx, now, cfg):
         r = t["target_r"] if out == "objetivo" else (-1.0 if out == "stop" else (px - t["entry"]) * sign / t["risk_per_oz"])
         t.update(status=out, exit=round(px, 2), exit_time=hm(to_local(at, t["tz"])), r=round(r, 3))
         if t.get("lots"):
-            t["usd"] = round((px - t["entry"]) * sign * t["lots"] * contract - spread * t["lots"] * contract, 2)
+            com = float(cfg.get("commission_per_lot") or (prop_cfg(cfg) or {}).get("commission_per_lot") or 0)
+            t["usd"] = round((px - t["entry"]) * sign * t["lots"] * contract - (spread * contract + com) * t["lots"], 2)
         changed.append(t)
     return changed
 

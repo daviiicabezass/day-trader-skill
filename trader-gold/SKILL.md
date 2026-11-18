@@ -108,9 +108,11 @@ cuenta como vela, y una vela solo cuenta cuando ha cerrado.
 Con `"prop"` en `trader/gold.json`, la skill opera dentro de las normas de la cuenta:
 
 ```json
-{"balance": 10000, "max_loss_usd": 50, "leverage": 50,
+{"balance": 10000, "leverage": 50, "spread": 0.30,
  "prop": {"name": "FTMO 2-Step 10k", "initial_balance": 10000, "phase": 1, "start_date": "2026-11-19",
-          "daily_stop_usd": 150, "max_losses_per_day": 2, "safety_usd": 50}}
+          "risk_pct": 1.0, "halve_below_pct": 5.0, "daily_stop_usd": 200, "max_losses_per_day": 2,
+          "max_open_trades": 1, "friday_no_entries_after_cet": "19:30", "commission_per_lot": 0.0,
+          "safety_usd": 50}}
 ```
 
 | norma FTMO 2-Step | valor | qué hace la skill |
@@ -121,9 +123,15 @@ Con `"prop"` en `trader/gold.json`, la skill opera dentro de las normas de la cu
 | Días mínimos | 4 | `prop` los cuenta |
 | Noticias | libres en Challenge y Verification; en la cuenta FTMO (Standard), en XAUUSD nada se ejecuta (ni SL ni TP) de 2 minutos antes a 2 después de una noticia marcada | aviso: en la cuenta FTMO, evita tener el stop o el objetivo cerca del precio a las 14:30 o las 16:00 de España |
 | Apalancamiento XAUUSD | 1:50 Standard, 1:15 Swing (desde el 1 de febrero de 2026) | `"leverage": 50` |
-| Fin de semana | en Standard no se deja nada abierto: la skill cierra todo en el día | ya lo hace (`flat_by`) |
+| Fin de semana / noche | libre en Challenge y Verification; en la cuenta FTMO Standard, nada abierto en pausas de más de 2 horas | la skill cierra todo en el día (`flat_by`) |
+| Gap trading (prohibido) | no abrir a menos de 2 horas de un cierre largo del mercado | el viernes, nada nuevo después de las 19:30 de España (el oro cierra a las 22:00) |
+| Riesgo constante (prácticas prohibidas: tamaños muy distintos, exposición concentrada) | | riesgo fijo `risk_pct` del saldo inicial y una sola operación a la vez (`max_open_trades`) |
+| Comisión | mírala en MT5, Especificación del símbolo | `commission_per_lot` entra en los lotes y en el diario |
+| Consistencia | el 2-Step no tiene regla de consistencia; solo los días mínimos | si llegas al objetivo antes de 4 días, completa los días con 0,01 lotes |
+| Inactividad | 30 días sin operar: aviso; 30 más: cierre | |
 
-Además, tus frenos, más estrictos que FTMO: deja de operar el día tras 2 stops o 150 $ de pérdida.
+Además, tus frenos, más estrictos que FTMO: deja de operar el día tras 2 stops o 200 $ de pérdida, y si el
+saldo cae un 5 % el riesgo baja a la mitad (0,5 %) hasta recuperarlo.
 `python3 trader-gold/gold.py prop` enseña el saldo según el diario, los límites de hoy, el objetivo y los días.
 El saldo sale del diario (con spread, sin comisiones ni swap): compruébalo siempre con el panel de FTMO.
 
