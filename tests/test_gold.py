@@ -518,3 +518,25 @@ class PropRules(unittest.TestCase):
         o = g.size_order(plan, dict(g.DEFAULTS, max_loss_usd=100.0, commission_per_lot=7.0))
         self.assertEqual(o["volume"], 0.09)          # 100 / (10,30 x 100 + 7) = 0,0964
         self.assertEqual(o["max_loss_usd"], 93.33)
+
+
+class Forex(unittest.TestCase):
+    def tearDown(self):
+        g.apply_symbol(dict(g.DEFAULTS, _raw={}), "XAUUSD")
+
+    def test_eurusd_pips_lots_and_commission(self):
+        cfg = g.apply_symbol(dict(g.DEFAULTS, _raw={}), "EURUSD")
+        self.assertEqual((g.DIG, g.PREFIX, cfg["contract_size"], cfg["leverage"]), (5, "eurusd", 100000, 100))
+        self.assertEqual(g.floor_c(1.085437), 1.08543)
+        entry = {"status": "triggered", "side": "short", "entry": 1.08500,
+                 "opening_range": {"high": 1.08700, "low": 1.08510}}
+        p = g.make_plan(entry, "or-mid", "1R", cfg)
+        self.assertEqual((p["stop"], p["target"]), (1.08605, 1.08395))   # 10,5 pips
+        o = g.size_order(p, dict(cfg, max_loss_usd=100.0))
+        # 100 / (0,00108 x 100.000 + 5 $) = 0,88 lotes
+        self.assertEqual(o["volume"], 0.88)
+        self.assertIn("1.08605", g.ticket_report(o))
+
+    def test_gold_keeps_its_own_config(self):
+        cfg = g.apply_symbol(dict(g.DEFAULTS, leverage=50, spread=0.3, _raw={"leverage": 50, "spread": 0.3}), "XAUUSD")
+        self.assertEqual((g.DIG, cfg["contract_size"], cfg["leverage"]), (2, 100, 50))

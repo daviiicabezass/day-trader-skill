@@ -50,6 +50,47 @@ import urllib.request
 UA = "day-trader-skill/2.0 (trader-gold)"
 FIVE = datetime.timedelta(minutes=5)
 TRADER = "trader"
+DIG = 2          # decimales del precio del simbolo activo (2 en el oro, 5 en EURUSD/GBPUSD)
+PREFIX = "gold"  # prefijo de los archivos en trader/: gold-entry.json, eurusd-entry.json...
+
+# Simbolos que sabe operar. Un lote de oro son 100 onzas; uno de EURUSD o GBPUSD, 100.000 de la divisa base,
+# y cada pip (0,0001) vale 10 $ por lote. Spread y comision: FTMO (cuenta Standard, noviembre de 2026).
+SYMBOLS = {
+    "XAUUSD": {"symbol": "XAUUSD", "yahoo_symbol": "GC=F", "contract_size": 100, "digits": 2, "spread": 0.30,
+               "commission_per_lot": 0.0, "leverage": 50, "unit": "onzas", "futures": True, "prefix": "gold"},
+    "EURUSD": {"symbol": "EURUSD", "yahoo_symbol": "EURUSD=X", "contract_size": 100000, "digits": 5,
+               "spread": 0.00003, "commission_per_lot": 5.0, "leverage": 100, "unit": "unidades", "futures": False,
+               "basis": 0.0, "prefix": "eurusd"},
+    "GBPUSD": {"symbol": "GBPUSD", "yahoo_symbol": "GBPUSD=X", "contract_size": 100000, "digits": 5,
+               "spread": 0.00005, "commission_per_lot": 5.0, "leverage": 100, "unit": "unidades", "futures": False,
+               "basis": 0.0, "prefix": "gbpusd"},
+}
+
+
+def fp(x):
+    """Un precio con los decimales del simbolo."""
+    return "%.*f" % (DIG, x)
+
+
+def rp(x):
+    return round(x, DIG)
+
+
+def apply_symbol(cfg, name):
+    """Mezcla el preajuste del simbolo con la configuracion (lo de 'symbols' en gold.json manda)."""
+    global DIG, PREFIX
+    name = (name or "XAUUSD").upper()
+    if name not in SYMBOLS:
+        raise GoldError("simbolo desconocido: %s (usa %s)" % (name, ", ".join(sorted(SYMBOLS))))
+    base = dict(SYMBOLS[name])
+    if name == "XAUUSD":   # el oro conserva lo que ya tuviera la configuracion de nivel superior
+        for k in ("symbol", "yahoo_symbol", "contract_size", "spread", "leverage", "commission_per_lot"):
+            if k in cfg.get("_raw", {}):
+                base[k] = cfg[k]
+    cfg.update(base)
+    cfg.update((cfg.get("symbols") or {}).get(name, {}))
+    DIG, PREFIX = int(cfg["digits"]), cfg["prefix"]
+    return cfg
 
 DEFAULTS = {
     "symbol": "XAUUSD",          # el nombre en tu MT5 (XAUUSD, GOLD, XAUUSD.r...)
@@ -214,6 +255,7 @@ def load_config(path=None):
     raw = load_json(path or os.path.join(TRADER, "gold.json"))
     if raw:
         cfg.update(raw)
+    cfg["_raw"] = raw or {}
     return cfg
 
 
@@ -385,7 +427,7 @@ def load_bars(a, cfg):
         return parse_mt5_csv(read_text(a.csv), tz), "MT5 CSV %s (hora del servidor %s)" % (os.path.basename(a.csv), tz)
     sym = cfg["yahoo_symbol"]
     text = read_text(a.offline) if a.offline else fetch_yahoo(sym)
-    note = "Yahoo %s, futuros (gratuito, no oficial, puede ir con retraso)" % sym
+    note = "Yahoo %s, %s (gratuito, no oficial, puede ir con retraso)" % (sym, "futuros" if cfg.get("futures") else "contado")
     if basis:
         note += ", base %+.2f" % basis
     return parse_yahoo(text, basis), note
@@ -394,15 +436,18 @@ def load_bars(a, cfg):
 # ---------------------------------------------------------------- redondeo
 
 def floor_c(x):
-    return math.floor(x * 100 + 1e-6) / 100.0
+    m = 10 ** DIG
+    return round(math.floor(x * m + 1e-6) / m, DIG)
 
 
 def ceil_c(x):
-    return math.ceil(x * 100 - 1e-6) / 100.0
+    m = 10 ** DIG
+    return round(math.ceil(x * m - 1e-6) / m, DIG)
 
 
 def round_c(x):
-    return math.floor(x * 100 + 0.5 + 1e-9) / 100.0
+    m = 10 ** DIG
+    return round(math.floor(x * m + 0.5 + 1e-9) / m, DIG)
 
 
 def floor_step(x, step):
@@ -440,7 +485,7 @@ def orb(idx, sess, day, now_utc, or_minutes=15, side="both"):
         doc["status"] = "no_data"
         return doc
     hi, lo = rg
-    doc["opening_range"] = {"high": round(hi, 2), "low": round(lo, 2), "minutes": or_minutes}
+    doc["opening_range"] = {"high": rp(hi), "low": rp(lo), "minutes": or_minutes}
     i, last = k, None
     while True:
         t = open_utc + i * FIVE
@@ -458,11 +503,11 @@ def orb(idx, sess, day, now_utc, or_minutes=15, side="both"):
         elif side in ("short", "both") and b[4] < lo:
             hit = "short"
         if hit:
-            doc.update(status="triggered", side=hit, entry=round(b[4], 2), entry_bar=i - 1,
+            doc.update(status="triggered", side=hit, entry=rp(b[4]), entry_bar=i - 1,
                        entry_time=hm(to_local(end, sess["tz"])), entry_utc=end.isoformat() + "Z")
             return doc
     if last is not None:
-        doc["last_close"] = round(last[4], 2)
+        doc["last_close"] = rp(last[4])
         doc["last_bar_time"] = hm(to_local(last[0], sess["tz"]))
     doc["status"] = "expired" if now_utc >= cutoff_utc else "waiting"
     doc["cutoff"] = hm(to_local(cutoff_utc, sess["tz"]))
@@ -471,7 +516,7 @@ def orb(idx, sess, day, now_utc, or_minutes=15, side="both"):
 
 def orb_report(doc, source):
     sess, tzn = doc["session_name"], TZ_NAMES[doc["tz"]]
-    head = "XAUUSD  sesion de %s, %s  rango de apertura de %d minutos, velas de 5 minutos (%s)" % (
+    head = doc.get("symbol", "XAUUSD") + "  sesion de %s, %s  rango de apertura de %d minutos, velas de 5 minutos (%s)" % (
         sess, doc["date"], doc["or_minutes"], source)
     st = doc["status"]
     if st == "closed":
@@ -483,18 +528,18 @@ def orb_report(doc, source):
     if st == "no_data":
         return head + "\nFaltan velas del rango de apertura en los datos: no puedo calcularlo."
     r = doc["opening_range"]
-    lines = [head, "Rango de apertura: maximo %.2f, minimo %.2f (%.2f de ancho)." % (r["high"], r["low"], r["high"] - r["low"])]
+    lines = [head, "Rango de apertura: maximo %s, minimo %s (%s de ancho)." % (fp(r["high"]), fp(r["low"]), fp(r["high"] - r["low"]))]
     if st == "triggered":
         lado = "LARGO (compra)" if doc["side"] == "long" else "CORTO (venta)"
         rel = "por encima del maximo" if doc["side"] == "long" else "por debajo del minimo"
-        lines.append("ACTIVADO %s a las %s (%s) en %.2f: la vela %d cerro %s del rango." % (
-            lado, doc["entry_time"], tzn, doc["entry"], doc["entry_bar"], rel))
+        lines.append("ACTIVADO %s a las %s (%s) en %s: la vela %d cerro %s del rango." % (
+            lado, doc["entry_time"], tzn, fp(doc["entry"]), doc["entry_bar"], rel))
         lines.append("No se ha colocado nada. Siguiente: el stop y el objetivo ANTES de entrar: gold.py plan.")
     elif st == "waiting":
         if "last_close" in doc:
             lc = doc["last_close"]
-            lines.append("ESPERANDO  ultimo cierre %.2f (vela de las %s): %.2f bajo el maximo, %.2f sobre el minimo." % (
-                lc, doc["last_bar_time"], r["high"] - lc, lc - r["low"]))
+            lines.append("ESPERANDO  ultimo cierre %s (vela de las %s): %s bajo el maximo, %s sobre el minimo." % (
+                fp(lc), doc["last_bar_time"], fp(r["high"] - lc), fp(lc - r["low"])))
         else:
             lines.append("ESPERANDO  todavia no ha cerrado ninguna vela despues del rango.")
         lines.append("Entradas hasta las %s (%s)." % (doc["cutoff"], tzn))
@@ -537,24 +582,24 @@ def make_plan(entry, stop_rule="or-mid", target="2R", cfg=None):
         raise GoldError("un stop %s necesita el rango de apertura (--or-high y --or-low)" % stop_rule)
     stop = stop_from_rule(stop_rule, side, e, r.get("high"), r.get("low"))
     sign = 1 if side == "long" else -1
-    risk = round((e - stop) * sign, 2)
+    risk = rp((e - stop) * sign)
     if risk <= 0:
-        raise GoldError("el stop %.2f esta en el lado equivocado de la entrada %.2f" % (stop, e))
+        raise GoldError("el stop %s esta en el lado equivocado de la entrada %s" % (fp(stop), fp(e)))
     spread = float(cfg["spread"])
     if risk < 3 * spread:
-        raise GoldError("stop demasiado ajustado: %.2f de riesgo con un spread de %.2f; el ruido normal te sacaria. "
-                        "Usa un stop mas amplio (or-opposite o usd:X)." % (risk, spread))
+        raise GoldError("stop demasiado ajustado: %s de riesgo con un spread de %s; el ruido normal te sacaria. "
+                        "Usa un stop mas amplio (or-opposite o usd:X)." % (fp(risk), fp(spread)))
     t = str(target).upper()
     if t.endswith("R"):
         rr = float(t[:-1])
         tgt = round_c(e + sign * rr * risk)
     elif t.startswith("PRICE:"):
-        tgt = round(float(t[6:]), 2)
+        tgt = rp(float(t[6:]))
         rr = round((tgt - e) * sign / risk, 2)
     else:
         raise GoldError("--target no valido: %r (2R, 1.5R, price:X)" % target)
     if rr <= 0:
-        raise GoldError("el objetivo %.2f esta en el lado equivocado de la entrada %.2f" % (tgt, e))
+        raise GoldError("el objetivo %s esta en el lado equivocado de la entrada %s" % (fp(tgt), fp(e)))
     plan = dict(entry)
     plan.update(created_by="trader-gold", symbol=cfg["symbol"], entry=e, stop=stop,
                 stop_rule=stop_rule.split(":")[0], stop_arg=stop_rule, stop_label=STOP_LABELS[stop_rule.split(":")[0]],
@@ -567,10 +612,10 @@ def plan_report(p):
     lado = "LARGO" if p["side"] == "long" else "CORTO"
     return "\n".join([
         "Plan de salida: %s %s, %s, sesion de %s" % (p["symbol"], lado, p["date"], p["session_name"]),
-        "  Entrada      %.2f a las %s (%s)" % (p["entry"], p.get("entry_time", "?"), tzn),
-        "  Stop         %.2f  %s" % (p["stop"], p["stop_label"]),
-        "  Objetivo     %.2f  %sR" % (p["target"], _num(p["target_r"])),
-        "  Riesgo/onza  %.2f" % p["risk_per_oz"],
+        "  Entrada      %s a las %s (%s)" % (fp(p["entry"]), p.get("entry_time", "?"), tzn),
+        "  Stop         %s  %s" % (fp(p["stop"]), p["stop_label"]),
+        "  Objetivo     %s  %sR" % (fp(p["target"]), _num(p["target_r"])),
+        "  Riesgo       %s por unidad%s" % (fp(p["risk_per_oz"]), " (%.1f pips)" % (p["risk_per_oz"] * 10000) if DIG >= 4 else ""),
         "  Fuera a las  %s (%s), se gane o se pierda" % (p.get("flat_by", "?"), tzn),
         "Un stop es un plan, no una garantia: con un gap o una noticia fuerte puede ejecutarse peor.",
     ])
@@ -752,8 +797,8 @@ def replay_report(doc):
         "  stop primero      %5.1f %%" % mc["stop"],
         "  ninguno           %5.1f %%   todavia abierta a las %s" % (mc["neither"], doc["flat_by"]),
         "  en verde          %5.1f %%   objetivo primero, o a favor a las %s" % (mc["green"], doc["flat_by"]),
-        "  Precio a las %s: mediana %.2f, 90 %% de las repeticiones entre %.2f y %.2f." % (
-            doc["flat_by"], mc["median"], mc["p5"], mc["p95"]),
+        "  Precio a las %s: mediana %s, 90 %% de las repeticiones entre %s y %s." % (
+            doc["flat_by"], fp(mc["median"]), fp(mc["p5"]), fp(mc["p95"])),
         "  R media: %+.3f" % mc["avg_r"],
     ]
     if h["fired"]:
@@ -917,7 +962,7 @@ def backtest(idx, sess, cfg, rr=1.0, stop_rule="or-mid", trend=False, width=Fals
         res["fired"] += 1
         res[out] += 1
         res["r"].append(net)
-        res["trades"].append({"date": d.isoformat(), "side": s, "entry": round(e, 2), "outcome": out, "r": round(net, 3)})
+        res["trades"].append({"date": d.isoformat(), "side": s, "entry": rp(e), "outcome": out, "r": round(net, 3)})
     rl = res.pop("r")
     res["total_r"] = sum(rl)
     res["avg_r"] = sum(rl) / len(rl) if rl else None
@@ -984,7 +1029,8 @@ def prop_status(trades, cfg, now):
     before = sum(t["usd"] for t in closed if day_of(t) < today)
     today_closed = [t for t in closed if day_of(t) == today]
     today_pnl = sum(t["usd"] for t in today_closed)
-    open_risk = sum(t["lots"] * (t["risk_per_oz"] + spread) * contract for t in mine
+    open_risk = sum(t["lots"] * ((t["risk_per_oz"] + t.get("spread", spread)) * t.get("contract", contract)
+                                 + t.get("commission_per_lot", 0)) for t in mine
                     if t["status"] == "abierta" and t.get("lots"))
     balance = init + before + today_pnl
     midnight = init + before
@@ -1062,14 +1108,16 @@ def size_order(plan, cfg, room=None):
     step, lmin, lmax = float(cfg["lot_step"]), float(cfg["lot_min"]), float(cfg["lot_max"])
     if plan.get("reward_risk", 0) + 1e-9 < float(cfg["min_reward_risk"]):
         raise GoldError("recompensa:riesgo %.2f por debajo de tu minimo %.2f" % (plan["reward_risk"], cfg["min_reward_risk"]))
-    risk_oz = abs(e - stop) + spread
     commission = float(cfg.get("commission_per_lot") or 0)
+    risk_oz = abs(e - stop) + spread
     risk_lot = risk_oz * contract + commission
     equity = float(cfg["balance"]) * (1 - float(cfg["cash_buffer_pct"]) / 100.0)
     margin_lot = contract * e / float(cfg["leverage"])
     limits = [
         ("perdida maxima", floor_step(float(cfg["max_loss_usd"]) / risk_lot, step),
-         "%.2f $ / (%.2f de riesgo + %.2f de spread) x %g onzas" % (float(cfg["max_loss_usd"]), abs(e - stop), spread, contract)),
+         "%.2f $ / ((%s de riesgo + %s de spread) x %g %s%s)" % (float(cfg["max_loss_usd"]), fp(abs(e - stop)), fp(spread),
+                                                             contract, cfg.get("unit", "onzas"),
+                                                             " + %.2f $ de comision" % commission if commission else "")),
         ("margen", floor_step(equity / margin_lot, step),
          "%.2f $ disponibles / %.2f $ de margen por lote (apalancamiento 1:%g)" % (equity, margin_lot, float(cfg["leverage"]))),
         ("lote maximo", lmax, "lot_max en la configuracion"),
@@ -1093,7 +1141,7 @@ def size_order(plan, cfg, room=None):
              "margin_usd": round(lots * margin_lot, 2), "decided_by": decided,
              "limits": [{"limit": n, "lots": l, "math": m} for n, l, m in limits],
              "flat_by": plan.get("flat_by"), "tz": plan.get("tz"), "date": plan.get("date"),
-             "session": plan.get("session")}
+             "session": plan.get("session"), "contract": contract, "commission_per_lot": commission}
     return order
 
 
@@ -1115,13 +1163,13 @@ def ticket_report(o):
         "  Simbolo      %s" % o["symbol"],
         "  Tipo         Ejecucion por mercado, %s" % tipo,
         "  Volumen      %.2f lotes" % o["volume"],
-        "  Stop Loss    %.2f" % o["sl"],
-        "  Take Profit  %.2f" % o["tp"],
+        "  Stop Loss    %s" % fp(o["sl"]),
+        "  Take Profit  %s" % fp(o["tp"]),
         "  Perdida maxima si el stop se ejecuta en su precio: unos %.2f $ (puede ser peor en un mercado rapido)." % o["max_loss_usd"],
         "  Cierra lo que siga abierto a las %s (%s)." % (o.get("flat_by") or "?", tzn),
         "En MT5: F9 (Nueva orden) > Simbolo > Volumen > Stop Loss > Take Profit > %s." % (
             "Comprar por mercado" if o["type"] == "buy" else "Vender por mercado"),
-        "Comprueba antes que el precio en MT5 sigue cerca de %.2f: si se ha ido lejos, es otra operacion." % o["entry_ref"],
+        "Comprueba antes que el precio en MT5 sigue cerca de %s: si se ha ido lejos, es otra operacion." % fp(o["entry_ref"]),
         "Usa primero una cuenta demo.",
     ])
 
@@ -1203,7 +1251,7 @@ def cmd_orb(a, cfg):
     doc.update(flat_by=sess["flat_by"], source=source, symbol=cfg["symbol"], filter_notes=notes)
     print(json.dumps(doc, indent=2, ensure_ascii=False) if a.json else "\n".join([orb_report(doc, source)] + notes))
     if a.write and doc["status"] in ("triggered", "waiting"):
-        _write(os.path.join(TRADER, "gold-entry.json"), doc)
+        _write(os.path.join(TRADER, PREFIX + "-entry.json"), doc)
     return 0 if doc["status"] == "triggered" else 1
 
 
@@ -1220,29 +1268,29 @@ def cmd_plan(a, cfg):
         if a.or_high is not None and a.or_low is not None:
             entry["opening_range"] = {"high": a.or_high, "low": a.or_low, "minutes": entry["or_minutes"]}
     else:
-        entry = _need(os.path.join(TRADER, "gold-entry.json"), "ejecuta antes gold.py orb --write, o pasa --entry")
+        entry = _need(os.path.join(TRADER, PREFIX + "-entry.json"), "ejecuta antes gold.py orb --write, o pasa --entry")
     target = a.target or session_cfg(entry.get("session") or a.session, cfg).get("target") or "2R"
     plan = make_plan(entry, a.stop, target, cfg)
     print(json.dumps(plan, indent=2, ensure_ascii=False) if a.json else plan_report(plan))
     if a.write:
-        _write(os.path.join(TRADER, "gold-plan.json"), plan)
+        _write(os.path.join(TRADER, PREFIX + "-plan.json"), plan)
     return 0
 
 
 def cmd_replay(a, cfg):
-    plan = _need(os.path.join(TRADER, "gold-plan.json"), "ejecuta antes gold.py plan --write")
+    plan = _need(os.path.join(TRADER, PREFIX + "-plan.json"), "ejecuta antes gold.py plan --write")
     if plan.get("entry_bar") is None:
         raise GoldError("el plan no tiene entry_bar (la vela de entrada dentro de la sesion); pasalo con plan --entry-bar N")
     idx, _ = load_bars(a, cfg)
     doc = run_replay(idx, plan, cfg, a.replays, a.seed, a.window)
     print(json.dumps(doc, indent=2, ensure_ascii=False, default=str) if a.json else replay_report(doc))
     if a.write:
-        _write(os.path.join(TRADER, "gold-replay.json"), doc)
+        _write(os.path.join(TRADER, PREFIX + "-replay.json"), doc)
     return 0
 
 
 def cmd_size(a, cfg):
-    plan = _need(os.path.join(TRADER, "gold-plan.json"), "ejecuta antes gold.py plan --write")
+    plan = _need(os.path.join(TRADER, PREFIX + "-plan.json"), "ejecuta antes gold.py plan --write")
     for k in ("balance", "max_loss", "leverage", "spread"):
         v = getattr(a, k)
         if v is not None:
@@ -1258,7 +1306,7 @@ def cmd_size(a, cfg):
     o = size_order(plan, cfg, room=st["room_today"] if st else None)
     print(json.dumps(o, indent=2, ensure_ascii=False) if a.json else size_report(o))
     if a.write:
-        _write(os.path.join(TRADER, "gold-order.json"), o)
+        _write(os.path.join(TRADER, PREFIX + "-order.json"), o)
     return 0
 
 
@@ -1283,7 +1331,7 @@ def cmd_backtest(a, cfg):
 
 
 def cmd_ticket(a, cfg):
-    o = _need(os.path.join(TRADER, "gold-order.json"), "ejecuta antes gold.py size --write")
+    o = _need(os.path.join(TRADER, PREFIX + "-order.json"), "ejecuta antes gold.py size --write")
     print(ticket_report(o))
     return 0
 
@@ -1303,14 +1351,17 @@ def journal_add(doc, plan, order, cfg):
         raise GoldError("el plan no viene de gold.py orb (no tiene la hora de entrada); el diario necesita una senal de orb")
     trades = doc.setdefault("trades", [])
     for t in trades:
-        if (t["date"], t["session"], t["side"], t["entry"]) == (plan["date"], plan["session"], plan["side"], plan["entry"]):
+        if (t.get("symbol", "XAUUSD"), t["date"], t["session"], t["side"], t["entry"]) == (
+                plan.get("symbol", "XAUUSD"), plan["date"], plan["session"], plan["side"], plan["entry"]):
             raise GoldError("esta senal ya esta en el diario (#%d)" % t["id"])
     sess = session_cfg(plan["session"], cfg)
     _, _, flat = bounds(datetime.date.fromisoformat(plan["date"]), sess)
     lots = None
     if order and abs(order.get("sl", 0) - plan["stop"]) < 1e-9 and abs(order.get("tp", 0) - plan["target"]) < 1e-9:
         lots = order["volume"]
-    t = {"id": len(trades) + 1, "date": plan["date"], "session": plan["session"], "session_name": plan["session_name"],
+    t = {"id": len(trades) + 1, "symbol": plan.get("symbol", cfg["symbol"]), "digits": DIG,
+         "contract": float(cfg["contract_size"]), "spread": float(cfg["spread"]),
+         "commission_per_lot": float(cfg.get("commission_per_lot") or 0), "date": plan["date"], "session": plan["session"], "session_name": plan["session_name"],
          "tz": plan["tz"], "side": plan["side"], "entry": plan["entry"], "entry_time": plan.get("entry_time"),
          "entry_utc": plan["entry_utc"], "stop": plan["stop"], "target": plan["target"], "target_r": plan["target_r"],
          "risk_per_oz": plan["risk_per_oz"], "lots": lots, "flat_by": sess["flat_by"],
@@ -1322,11 +1373,12 @@ def journal_add(doc, plan, order, cfg):
 def journal_check(doc, idx, now, cfg):
     """Cierra las operaciones abiertas del diario con las velas: objetivo, stop (primero, si una vela toca los dos)
     o la hora de cierre forzoso."""
-    contract, spread = float(cfg["contract_size"]), float(cfg["spread"])
     changed = []
     for t in doc.get("trades", []):
-        if t["status"] != "abierta":
+        if t["status"] != "abierta" or t.get("symbol", "XAUUSD") != cfg["symbol"]:
             continue
+        contract = float(t.get("contract", cfg["contract_size"]))
+        spread = float(t.get("spread", cfg["spread"]))
         long = t["side"] == "long"
         start, flat = _utc(t["entry_utc"]), _utc(t["flat_utc"])
         out, px, at, last = None, None, None, None
@@ -1349,9 +1401,9 @@ def journal_check(doc, idx, now, cfg):
             out, px, at = "cierre", last[4], last[0] + FIVE
         sign = 1 if long else -1
         r = t["target_r"] if out == "objetivo" else (-1.0 if out == "stop" else (px - t["entry"]) * sign / t["risk_per_oz"])
-        t.update(status=out, exit=round(px, 2), exit_time=hm(to_local(at, t["tz"])), r=round(r, 3))
+        t.update(status=out, exit=rp(px), exit_time=hm(to_local(at, t["tz"])), r=round(r, 3))
         if t.get("lots"):
-            com = float(cfg.get("commission_per_lot") or (prop_cfg(cfg) or {}).get("commission_per_lot") or 0)
+            com = float(t.get("commission_per_lot", cfg.get("commission_per_lot") or 0) or 0)
             t["usd"] = round((px - t["entry"]) * sign * t["lots"] * contract - (spread * contract + com) * t["lots"], 2)
         changed.append(t)
     return changed
@@ -1361,13 +1413,15 @@ def journal_report(doc):
     trades = doc.get("trades", [])
     if not trades:
         return "El diario esta vacio. Apunta una senal con: gold.py journal add (despues de orb, plan y size)."
-    lines = ["Diario del oro (%d operaciones):" % len(trades),
-             "  #  fecha       sesion   lado   entrada   stop      objetivo  lotes  resultado            R       $"]
+    lines = ["Diario (%d operaciones):" % len(trades),
+             "  #  simbolo fecha       sesion   lado   entrada     stop        objetivo    lotes  resultado              R       $"]
     for t in trades:
-        res = t["status"] if t["status"] == "abierta" else "%s %s a %.2f" % (t["status"], t.get("exit_time", ""), t["exit"])
-        lines.append("  %-2d %s  %-7s  %-5s  %8.2f  %8.2f  %8.2f  %5s  %-19s %6s  %7s" % (
-            t["id"], t["date"], t["session"], "largo" if t["side"] == "long" else "corto", t["entry"], t["stop"],
-            t["target"], "%.2f" % t["lots"] if t.get("lots") else "-", res,
+        d = int(t.get("digits", 2))
+        f = lambda x: "%.*f" % (d, x)
+        res = t["status"] if t["status"] == "abierta" else "%s %s a %s" % (t["status"], t.get("exit_time", ""), f(t["exit"]))
+        lines.append("  %-2d %-7s %s  %-7s  %-5s  %10s  %10s  %10s  %5s  %-21s %6s  %7s" % (
+            t["id"], t.get("symbol", "XAUUSD"), t["date"], t["session"], "largo" if t["side"] == "long" else "corto",
+            f(t["entry"]), f(t["stop"]), f(t["target"]), "%.2f" % t["lots"] if t.get("lots") else "-", res,
             "%+.2f" % t["r"] if "r" in t else "", "%+.2f" % t["usd"] if "usd" in t else ""))
     done = [t for t in trades if t["status"] != "abierta"]
     if done:
@@ -1377,7 +1431,7 @@ def journal_report(doc):
             sum(t["r"] for t in done) / len(done)))
         usd = [t["usd"] for t in done if "usd" in t]
         if usd:
-            lines.append("Resultado en dolares (con spread, sin swap ni comisiones): %+.2f $." % sum(usd))
+            lines.append("Resultado en dolares (con spread y comision, sin swap): %+.2f $." % sum(usd))
         if len(done) < 30:
             lines.append("Con menos de 30 operaciones el resultado dice poco: sigue apuntando.")
     return "\n".join(lines)
@@ -1387,19 +1441,21 @@ def cmd_journal(a, cfg):
     path = journal_path()
     doc = load_json(path) or {"trades": []}
     if a.action == "add":
-        plan = _need(os.path.join(TRADER, "gold-plan.json"), "ejecuta antes gold.py orb --write y plan --write")
-        order = load_json(os.path.join(TRADER, "gold-order.json"))
+        plan = _need(os.path.join(TRADER, PREFIX + "-plan.json"), "ejecuta antes gold.py orb --write y plan --write")
+        order = load_json(os.path.join(TRADER, PREFIX + "-order.json"))
         t = journal_add(doc, plan, order, cfg)
         _write(path, doc)
-        print("Apuntada #%d: %s %s en %.2f, stop %.2f, objetivo %.2f%s." % (
-            t["id"], t["session_name"], "largo" if t["side"] == "long" else "corto", t["entry"], t["stop"], t["target"],
+        print("Apuntada #%d: %s %s %s en %s, stop %s, objetivo %s%s." % (
+            t["id"], t["symbol"], t["session_name"], "largo" if t["side"] == "long" else "corto", fp(t["entry"]),
+            fp(t["stop"]), fp(t["target"]),
             ", %.2f lotes" % t["lots"] if t["lots"] else " (sin lotes: ejecuta size --write antes para tenerlos)"))
         return 0
     if a.action == "check":
         if any(t["status"] == "abierta" for t in doc.get("trades", [])):
             idx, _ = load_bars(a, cfg)
             for t in journal_check(doc, idx, parse_now(a.now), cfg):
-                print("#%d cerrada: %s a las %s en %.2f (%+.2fR)." % (t["id"], t["status"], t["exit_time"], t["exit"], t["r"]))
+                print("#%d %s cerrada: %s a las %s en %s (%+.2fR)." % (t["id"], t.get("symbol", "XAUUSD"), t["status"],
+                                                                    t["exit_time"], fp(t["exit"]), t["r"]))
             _write(path, doc)
     print(journal_report(doc))
     return 0
@@ -1417,6 +1473,8 @@ def cmd_prop(a, cfg):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="gold.py", description="Day trading de oro (XAUUSD) para MetaTrader 5.")
     p.add_argument("--config", help="configuracion (por defecto trader/gold.json)")
+    p.add_argument("--symbol", default="XAUUSD", type=str.upper, choices=sorted(SYMBOLS),
+                   help="XAUUSD (por defecto), EURUSD o GBPUSD")
     sub = p.add_subparsers(dest="cmd")
 
     def data_opts(sp):
@@ -1495,7 +1553,7 @@ def main(argv=None):
         p.print_help()
         return 2
     try:
-        cfg = load_config(a.config)
+        cfg = apply_symbol(load_config(a.config), a.symbol)
         return {"clock": cmd_clock, "orb": cmd_orb, "plan": cmd_plan, "replay": cmd_replay,
                 "size": cmd_size, "ticket": cmd_ticket, "journal": cmd_journal,
                 "backtest": cmd_backtest, "prop": cmd_prop}[a.cmd](a, cfg)

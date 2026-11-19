@@ -103,6 +103,23 @@ salida 2.
 Las velas de 1 minuto se agrupan en velas de 5 minutos. El tick en vivo nunca
 cuenta como vela, y una vela solo cuenta cuando ha cerrado.
 
+## EUR/USD y GBP/USD
+
+`--symbol EURUSD` o `--symbol GBPUSD` (antes del comando) usa el mismo método con las divisas: velas de Yahoo
+`EURUSD=X` / `GBPUSD=X` (contado), 5 decimales, lotes de 100.000 (10 $ por pip y lote), comisión de FTMO de 5 $ por
+lote ida y vuelta y apalancamiento 1:100. Cada símbolo tiene sus archivos (`eurusd-plan.json`...), pero el diario y
+las normas de la cuenta de fondeo son comunes: la pérdida diaria, la máxima y el límite de una operación a la vez
+cuentan todo junto.
+
+```bash
+python3 trader-gold/gold.py --symbol EURUSD orb --session london --write
+python3 trader-gold/gold.py --symbol EURUSD backtest --session london --compare
+```
+
+Backtest de noviembre de 2026 (unas 59 sesiones): el rango de apertura en EURUSD y GBPUSD no mostró ventaja clara;
+casi todas las combinaciones salen negativas y las pocas positivas son las esperables por azar entre tantas
+pruebas. Úsalo en demo antes de arriesgar nada en divisas.
+
 ## Cuenta de fondeo (FTMO 2-Step)
 
 Con `"prop"` en `trader/gold.json`, la skill opera dentro de las normas de la cuenta:
